@@ -1,0 +1,25 @@
+# Basic experiment configuration (keep unchanged)
+policy_name: AudioX
+task_name: null
+task_config: null
+ckpt_setting: null
+seed: null
+instruction_type: unseen
+
+# AudioX Model Configuration
+# Option 1: Load from config + checkpoint (recommended for fine-tuned models)
+model_config: null    # Path to AudioX model config JSON (e.g., "configs/audiox_robot.json")
+ckpt_path: null       # Path to fine-tuned checkpoint (.ckpt or .safetensors)
+
+# Option 2: Load from HuggingFace pretrained (for base model)
+pretrained_name: null  # e.g., "HKUSTAudio/AudioX"
+
+# Action generation parameters
+action_dim: 16         # Robot action dimension: left_arm(7) + left_gripper(1) + right_arm(7) + right_gripper(1)
+action_chunk_size: 50  # Number of action steps per diffusion inference
+
+# Image preprocessing
+img_size: 224          # Input image size for vision encoder (square crop)
+
+# Inference options
+use_half: false        # Use fp16 for inference (saves GPU memory)
