@@ -1,24 +1,51 @@
-"""Robot model factory — thin wrapper around stable_audio_tools model creation."""
+"""Robot model factory — uses AudioX's create_model_from_config directly.
+
+AudioX is a 'diffusion_cond' model in stable_audio_tools.  Our JSON configs
+use model_type='robot_diffusion' as a marker; this function remaps it to the
+AudioX-native 'diffusion_cond' type before calling the factory.
+"""
+
+import os
+import sys
+
+# Reuse the same AUDIOX_PATH resolution logic as audiox_model.py so that
+# the *local* AudioX source (not the pip package) is found first.
+_policy_dir = os.path.dirname(os.path.abspath(__file__))
+_audiox_search_paths = [
+    os.environ.get("AUDIOX_PATH", ""),
+    os.path.join(_policy_dir, "../../../../AudioX-"),
+    os.path.join(_policy_dir, "../../../AudioX-"),
+    os.path.join(_policy_dir, "../../AudioX-"),
+]
+for _p in _audiox_search_paths:
+    if not _p:
+        continue
+    _p = os.path.abspath(_p)
+    if os.path.isdir(os.path.join(_p, "stable_audio_tools")):
+        if _p not in sys.path:
+            sys.path.insert(0, _p)
+        break
 
 from stable_audio_tools.models.factory import create_model_from_config
 
 
 def create_robot_model_from_config(config):
-    """Create a diffusion model from a robot config dict.
+    """Create an AudioX diffusion model from a robotics config dict.
 
-    This is a thin wrapper around stable_audio_tools' create_model_from_config.
-    The config must follow the AudioX model config schema with model_type,
-    action_dim, model.diffusion, and model.conditioning sections.
+    Maps model_type 'robot_diffusion' -> 'diffusion_cond' (AudioX native).
 
     Args:
         config: dict loaded from a robotx_*.json config file.
 
     Returns:
-        nn.Module: The complete AudioX diffusion model (DiT + MultiConditioner).
+        The AudioX DiffusionCond model (DiT backbone + MultiConditioner).
     """
-    model = create_model_from_config(config)
+    factory_config = dict(config)
 
-    # Attach config for later reference (e.g., sample_size, sample_rate)
+    # AudioX's factory expects 'diffusion_cond'
+    if factory_config.get("model_type") == "robot_diffusion":
+        factory_config["model_type"] = "diffusion_cond"
+
+    model = create_model_from_config(factory_config)
     model._config = config
-
     return model
