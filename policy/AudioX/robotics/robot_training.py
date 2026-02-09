@@ -89,23 +89,79 @@ class RobotDiffusionTrainingWrapper(pl.LightningModule):
             t = torch.rand(batch_size, device=self.device)
         return t
 
+    @torch.no_grad()
+    def _encode_images_clip(self, metadata):
+        """Encode camera images through CLIP independently, concatenate features.
+
+        RDT-style: each camera view is processed through CLIP individually,
+        then all patch token sequences are concatenated along dim=1.
+        No temporal transformer — preserves full per-view spatial information.
+
+        Returns:
+            [concat_features, mask] matching AudioX conditioner output format.
+        """
+        clip_cond = self.diffusion.conditioner.conditioners["video"]
+        clip_model = clip_cond.visual_encoder_model
+
+        batch_size = len(metadata)
+        num_cams = len(metadata[0]["camera_images"])
+        all_features = []
+
+        for cam_idx in range(num_cams):
+            # Stack this camera across batch: (B, C, H, W)
+            cam_batch = torch.stack(
+                [m["camera_images"][cam_idx] for m in metadata]
+            ).to(self.device)
+
+            outputs = clip_model(pixel_values=cam_batch)
+            # last_hidden_state: (B, num_patches+1, hidden_dim)
+            all_features.append(outputs.last_hidden_state)
+
+        # Concatenate all cameras: (B, num_cams * num_tokens, hidden_dim)
+        concat_features = torch.cat(all_features, dim=1)
+        mask = torch.ones(batch_size, 1).to(self.device)
+
+        return [concat_features, mask]
+
+    def _build_conditioning(self, metadata):
+        """Build conditioning with RDT-style multi-view concatenation.
+
+        - T5, trajectory: processed via AudioX conditioners as usual
+        - Video: each camera independently through CLIP, then token concatenation
+        """
+        conditioner = self.diffusion.conditioner
+        conditioning = {}
+
+        # Process non-video conditioners normally
+        for key, cond_module in conditioner.conditioners.items():
+            if key == "video":
+                continue
+            inputs = [m[key] for m in metadata]
+            conditioning[key] = cond_module(inputs, self.device)
+
+        # RDT-style: independent CLIP per camera, concatenate tokens
+        conditioning["video"] = self._encode_images_clip(metadata)
+
+        return conditioning
+
     def training_step(self, batch, batch_idx):
         actions, metadata = batch  # actions: (B, action_dim, chunk_size)
         batch_size = actions.shape[0]
 
-        # --- Conditioning ---
-        conditioning = self.diffusion.conditioner(metadata, self.device)
+        # --- Conditioning (RDT-style multi-view) ---
+        conditioning = self._build_conditioning(metadata)
 
         # Classifier-free guidance dropout: randomly mask conditioning
         if self.cfg_dropout_prob > 0 and self.training:
             mask = torch.rand(batch_size, device=self.device) < self.cfg_dropout_prob
             if mask.any():
-                # Replace conditioning with empty for masked samples
-                null_meta = [{"prompt": "", "video": m["video"] * 0, "proprio": m["proprio"] * 0}
-                             for m in metadata]
-                null_cond = self.diffusion.conditioner(
-                    [null_meta[i] if mask[i] else metadata[i] for i in range(batch_size)],
-                    self.device,
+                null_meta = [{
+                    "prompt": "",
+                    "camera_images": [img * 0 for img in m["camera_images"]],
+                    "proprio": m["proprio"] * 0,
+                } for m in metadata]
+                null_cond = self._build_conditioning(
+                    [null_meta[i] if mask[i] else metadata[i] for i in range(batch_size)]
                 )
                 conditioning = null_cond
 

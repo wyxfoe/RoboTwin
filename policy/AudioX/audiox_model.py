@@ -49,7 +49,7 @@ else:
     )
 
 from stable_audio_tools.models.pretrained import get_pretrained_model
-from stable_audio_tools.inference.generation import generate_diffusion_cond
+from stable_audio_tools.inference.sampling import sample
 
 # Use our robotics adapter that remaps config keys for AudioX factory
 from robotics.robot_model import create_robot_model_from_config
@@ -246,51 +246,70 @@ class AudioXRobot:
             img = cv2.resize(img, (self.img_size[1], self.img_size[0]), interpolation=cv2.INTER_LINEAR)
         return img
 
-    def _prepare_video_conditioning(self, images_dict):
-        """
-        Prepare video conditioning input for AudioX's CLIP conditioner.
+    def _preprocess_camera_image(self, img):
+        """Convert a raw camera image (H,W,3 uint8 or float) to CLIP-normalized (C,H,W) tensor."""
+        if img.dtype == np.uint8:
+            img = img.astype(np.float32) / 255.0
+        img_tensor = torch.from_numpy(img).permute(2, 0, 1)  # (3, H, W)
+        img_tensor = (img_tensor - self._clip_mean) / self._clip_std
+        return img_tensor
 
-        Converts camera images to properly normalized video tensor
-        expected by CLIP-ViT-B/32.
+    @torch.no_grad()
+    def _encode_images_clip(self, images_dict):
+        """Encode camera images through CLIP independently, concatenate features.
+
+        RDT-style: each camera view is processed through CLIP individually,
+        then all patch token sequences are concatenated along dim=1.
+        No temporal transformer — preserves full per-view spatial information.
+
+        Returns:
+            [concat_features, mask] matching AudioX conditioner output format.
         """
-        frames = []
+        clip_cond = self.model.conditioner.conditioners["video"]
+        clip_model = clip_cond.visual_encoder_model
+
+        all_features = []
         for key in ["head", "left_wrist", "right_wrist"]:
             img = images_dict[key]
-            # Convert to float [0, 1]
-            if img.dtype == np.uint8:
-                img = img.astype(np.float32) / 255.0
-            img_tensor = torch.from_numpy(img).permute(2, 0, 1)  # (3, H, W)
-            # Apply CLIP normalization: (x - mean) / std
-            img_tensor = (img_tensor - self._clip_mean) / self._clip_std
-            frames.append(img_tensor)
+            img_tensor = self._preprocess_camera_image(img)
+            # (1, C, H, W) for single image batch
+            img_batch = img_tensor.unsqueeze(0).to(self.device)
 
-        # Stack frames as a video sequence: (num_frames, C, H, W)
-        video_tensor = torch.stack(frames, dim=0)
-        return video_tensor
+            outputs = clip_model(pixel_values=img_batch)
+            # last_hidden_state: (1, num_patches+1, hidden_dim)
+            all_features.append(outputs.last_hidden_state)
 
-    def _prepare_conditioning(self):
-        """
-        Prepare all conditioning inputs for the AudioX model.
+        # Concatenate all cameras: (1, num_cams * num_tokens, hidden_dim)
+        concat_features = torch.cat(all_features, dim=1)
+        mask = torch.ones(1, 1).to(self.device)
 
-        Returns conditioning dict compatible with AudioX's MultiConditioner.
-        Keys must match the conditioner `id` fields in the config.
+        return [concat_features, mask]
+
+    @torch.no_grad()
+    def _build_conditioning(self):
+        """Build conditioning with RDT-style multi-view concatenation.
+
+        - T5, trajectory: processed via AudioX conditioners as usual
+        - Video: each camera independently through CLIP, then token concatenation
         """
         assert self.observation_window is not None, "Must call update_observation_window first!"
 
+        conditioner = self.model.conditioner
         conditioning = {}
 
-        # Text conditioning (language instruction)
-        if self.instruction is not None:
-            conditioning["prompt"] = self.instruction
+        # Process non-video conditioners normally
+        metadata = [{
+            "prompt": self.instruction or "",
+            "proprio": self.observation_window["state"],
+        }]
+        for key, cond_module in conditioner.conditioners.items():
+            if key == "video":
+                continue
+            inputs = [metadata[0][key]]
+            conditioning[key] = cond_module(inputs, self.device)
 
-        # Video conditioning (camera images as CLIP-normalized video frames)
-        video_tensor = self._prepare_video_conditioning(self.observation_window["images"])
-        conditioning["video"] = video_tensor
-
-        # Proprioceptive state conditioning
-        # Key must be "proprio" to match config conditioner id
-        state = self.observation_window["state"]
-        conditioning["proprio"] = state
+        # RDT-style: independent CLIP per camera, concatenate tokens
+        conditioning["video"] = self._encode_images_clip(self.observation_window["images"])
 
         return conditioning
 
@@ -300,7 +319,7 @@ class AudioXRobot:
         Generate robot actions using AudioX diffusion inference.
 
         Pipeline:
-          1. Prepare conditioning (text + video + proprio)
+          1. Build conditioning (RDT-style multi-view CLIP + T5 + proprio)
           2. Run diffusion sampling → raw output (batch, action_dim, chunk_size)
           3. Transpose to robot convention (chunk_size, action_dim)
           4. Apply ActionHead (LayerNorm + MLP) for action-space projection
@@ -312,39 +331,38 @@ class AudioXRobot:
         """
         assert self.observation_window is not None, "Must call update_observation_window first!"
 
-        conditioning = self._prepare_conditioning()
+        # Step 1: Build conditioning (bypasses CLIPConditioner temporal transformer)
+        conditioning = self._build_conditioning()
+        cond_inputs = self.model.get_conditioning_inputs(conditioning)
 
-        # Step 1: Run diffusion sampling
-        # generate_diffusion_cond outputs audio-format tensor: (batch, channels, length)
-        # For robotics: channels = action_dim, length = chunk_size
-        output = generate_diffusion_cond(
-            self.model,
-            conditioning=[conditioning],
-            sample_size=self.sample_size,
-            sample_rate=self.sample_rate,
-            device=self.device,
-            seed=None,
-        )
+        # Step 2: Diffusion sampling
+        noise = torch.randn(1, self.action_dim, self.action_chunk_size).to(self.device)
 
-        # Step 2: Transpose from audio layout (action_dim, chunk_size) to robot layout (chunk_size, action_dim)
-        if isinstance(output, torch.Tensor):
-            # output: (batch, action_dim, chunk_size)
-            actions = output.squeeze(0)  # (action_dim, chunk_size)
+        if self.model.diffusion_objective == "v":
+            output = sample(
+                self.model.model, noise, steps=50, starting_t=0,
+                **cond_inputs, cfg_scale=3.0, batch_cfg=True,
+            )
         else:
-            actions = torch.tensor(output, dtype=torch.float32).squeeze(0)
+            from stable_audio_tools.inference.sampling import sample_discrete_euler
+            output = sample_discrete_euler(
+                self.model.model, noise, steps=50,
+                **cond_inputs, cfg_scale=3.0, batch_cfg=True,
+            )
 
-        actions = actions.T  # (chunk_size, action_dim)
+        # Step 3: Transpose (action_dim, chunk_size) → (chunk_size, action_dim)
+        actions = output.squeeze(0).T  # (chunk_size, action_dim)
         actions = actions[:self.action_chunk_size]
 
-        # Step 3: Apply ActionHead (LayerNorm + MLP projection)
+        # Step 4: Apply ActionHead
         actions = actions.to(self.device)
         actions = self.action_head(actions)
 
-        # Step 4: Denormalize from normalized space to real joint angles
+        # Step 5: Denormalize
         if self.action_stats is not None:
             actions = self._denormalize_actions(actions)
 
-        # Step 5: Clamp gripper values to valid range [0, 1]
+        # Step 6: Clamp gripper values
         actions = self._clamp_gripper(actions)
 
         return actions.cpu().numpy()
