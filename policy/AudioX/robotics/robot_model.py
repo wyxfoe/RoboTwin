@@ -32,19 +32,35 @@ from stable_audio_tools.models.factory import create_model_from_config
 def create_robot_model_from_config(config):
     """Create an AudioX diffusion model from a robotics config dict.
 
-    Maps model_type 'robot_diffusion' -> 'diffusion_cond' (AudioX native).
+    Our JSON uses a nested layout for readability::
 
-    Args:
-        config: dict loaded from a robotx_*.json config file.
+        model.diffusion.type / model.diffusion.config / model.conditioning
 
-    Returns:
-        The AudioX DiffusionCond model (DiT backbone + MultiConditioner).
+    AudioX's factory expects a flat layout::
+
+        model_type = "diffusion_cond"
+        model.type / model.config / model.conditioning
+
+    This function bridges the two.
     """
-    factory_config = dict(config)
+    import copy
+    factory_config = copy.deepcopy(config)
 
-    # AudioX's factory expects 'diffusion_cond'
+    # 1. model_type: 'robot_diffusion' -> AudioX's 'diffusion_cond'
     if factory_config.get("model_type") == "robot_diffusion":
         factory_config["model_type"] = "diffusion_cond"
+
+    # 2. Flatten model.diffusion.* up into model.*
+    model_section = factory_config.get("model", {})
+    diffusion_section = model_section.pop("diffusion", None)
+    if diffusion_section is not None:
+        model_section.update(diffusion_section)
+        factory_config["model"] = model_section
+
+    # 3. Add AudioX audio fields if missing
+    chunk_size = config.get("action_chunk_size", 50)
+    factory_config.setdefault("sample_rate", 1)
+    factory_config.setdefault("sample_size", chunk_size)
 
     model = create_model_from_config(factory_config)
     model._config = config
