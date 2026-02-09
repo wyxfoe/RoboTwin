@@ -2,7 +2,10 @@
     "model_type": "robot_diffusion",
     "action_dim": 16,
     "action_chunk_size": 64,
+    "sample_rate": 1,
+    "sample_size": 64,
     "model": {
+        "io_channels": 16,
         "diffusion": {
             "type": "dit",
             "diffusion_objective": "v",

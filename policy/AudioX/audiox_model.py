@@ -23,6 +23,10 @@ from PIL import Image
 current_file_path = os.path.abspath(__file__)
 policy_dir = os.path.dirname(current_file_path)
 
+# Ensure local robotics package is importable
+if policy_dir not in sys.path:
+    sys.path.insert(0, policy_dir)
+
 _audiox_search_paths = [
     os.environ.get("AUDIOX_PATH", ""),
     os.path.join(policy_dir, "../../../AudioX-"),
@@ -44,9 +48,11 @@ else:
         f"Searched: {[os.path.abspath(p) for p in _audiox_search_paths if p]}"
     )
 
-from stable_audio_tools.models.factory import create_model_from_config
 from stable_audio_tools.models.pretrained import get_pretrained_model
 from stable_audio_tools.inference.generation import generate_diffusion_cond
+
+# Use our robotics adapter that remaps config keys for AudioX factory
+from robotics.robot_model import create_robot_model_from_config
 
 
 # CLIP-ViT-B/32 normalization constants
@@ -150,7 +156,7 @@ class AudioXRobot:
         else:
             with open(model_config_path, "r") as f:
                 self.model_config = json.load(f)
-            self.model = create_model_from_config(self.model_config)
+            self.model = create_robot_model_from_config(self.model_config)
             if ckpt_path is not None:
                 self._load_checkpoint(ckpt_path)
 
@@ -164,8 +170,10 @@ class AudioXRobot:
         self.instruction = None
 
         # Extract sample rate and sample size from config if available
+        # sample_size = chunk_size (NOT chunk_size * action_dim)
+        # AudioX generates (batch, io_channels, sample_size) where io_channels = action_dim
         self.sample_rate = self.model_config.get("sample_rate", 1)
-        self.sample_size = self.model_config.get("sample_size", self.action_chunk_size * self.action_dim)
+        self.sample_size = self.model_config.get("sample_size", self.action_chunk_size)
 
         # Load action normalization statistics for denormalization
         self.action_stats = None

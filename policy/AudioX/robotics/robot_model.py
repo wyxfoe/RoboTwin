@@ -32,9 +32,17 @@ from stable_audio_tools.models.factory import create_model_from_config
 def create_robot_model_from_config(config):
     """Create an AudioX diffusion model from a robotics config dict.
 
-    AudioX factory expects certain fields at the top level (io_channels,
-    sample_rate, sample_size) that our robotics config stores inside
-    model.diffusion.config.  This function copies them up.
+    AudioX's create_diffusion_cond_from_config reads:
+        - config["model"]["io_channels"]          (NOT top-level!)
+        - config["model"]["diffusion"]["type"]
+        - config["model"]["diffusion"]["config"]
+        - config["model"]["conditioning"]
+        - config["sample_rate"]                    (top-level)
+        - config["sample_size"]                    (top-level)
+
+    Our robotics JSON stores io_channels inside model.diffusion.config,
+    so this function copies it up to model.io_channels where the factory
+    expects it.
     """
     import copy
     factory_config = copy.deepcopy(config)
@@ -43,11 +51,13 @@ def create_robot_model_from_config(config):
     if factory_config.get("model_type") == "robot_diffusion":
         factory_config["model_type"] = "diffusion_cond"
 
-    # AudioX factory reads io_channels from the top level
-    diff_cfg = factory_config.get("model", {}).get("diffusion", {}).get("config", {})
-    factory_config.setdefault("io_channels", diff_cfg.get("io_channels"))
+    # AudioX factory reads io_channels from config["model"], NOT top-level.
+    model_cfg = factory_config.setdefault("model", {})
+    diff_cfg = model_cfg.get("diffusion", {}).get("config", {})
+    if "io_channels" not in model_cfg:
+        model_cfg["io_channels"] = diff_cfg.get("io_channels", config.get("action_dim"))
 
-    # Audio-specific fields (robotics defaults)
+    # Audio-specific fields at top level (robotics defaults)
     factory_config.setdefault("sample_rate", 1)
     factory_config.setdefault("sample_size", config.get("action_chunk_size", 50))
 

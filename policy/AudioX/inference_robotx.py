@@ -31,13 +31,20 @@ import torch
 from PIL import Image
 from torchvision import transforms
 
+import sys
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
+
+# Import robotics module first — it sets up AUDIOX_PATH for stable_audio_tools
+from robotics.robot_model import create_robot_model_from_config
+from robotics.action_space import denormalize_actions
+
 from stable_audio_tools.inference.sampling import (
     get_alphas_sigmas,
     sample,
     sample_discrete_euler,
 )
-from stable_audio_tools.robotics.robot_model import create_robot_model_from_config
-from stable_audio_tools.robotics.action_space import denormalize_actions
 
 
 def load_model(config_path: str, ckpt_path: str, device: str = "cuda"):
@@ -174,7 +181,7 @@ def evaluate_on_episodes(
     device: str = "cuda",
 ):
     """Evaluate model on a directory of RoboTwin episodes."""
-    from stable_audio_tools.robotics.robotwin_dataset import create_robotwin_dataloader
+    from robotics.robotwin_dataset import create_robotwin_dataloader
 
     os.makedirs(output_dir, exist_ok=True)
 
