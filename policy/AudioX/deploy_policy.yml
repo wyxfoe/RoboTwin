@@ -17,8 +17,11 @@ pretrained_name: null  # e.g., "HKUSTAudio/AudioX"
 # Action normalization stats (saved during training by train_robotx.py)
 action_stats_path: null  # Path to action_stats.pt for denormalization (e.g., "checkpoints/robotx/action_stats.pt")
 
+# ActionHead weights (LayerNorm + MLP output projection, trained with the model)
+action_head_path: null   # Path to action_head.pt (optional, defaults to identity)
+
 # Action generation parameters
-action_dim: 16         # Robot action dimension: left_arm(7) + left_gripper(1) + right_arm(7) + right_gripper(1)
+action_dim: 16         # Robot action dimension: left_arm(N) + left_gripper(1) + right_arm(N) + right_gripper(1)
 action_chunk_size: 50  # Number of action steps per diffusion inference
 
 # Image preprocessing

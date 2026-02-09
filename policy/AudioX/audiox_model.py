@@ -11,6 +11,7 @@ import sys
 import json
 import numpy as np
 import torch
+import torch.nn as nn
 import cv2
 from PIL import Image
 
@@ -42,6 +43,45 @@ from stable_audio_tools.models.pretrained import get_pretrained_model
 from stable_audio_tools.inference.generation import generate_diffusion_cond
 
 
+# CLIP-ViT-B/32 normalization constants
+CLIP_IMAGE_MEAN = [0.48145466, 0.4578275, 0.40821073]
+CLIP_IMAGE_STD = [0.26862954, 0.26130258, 0.27577711]
+
+
+class ActionHead(nn.Module):
+    """
+    Output head for projecting diffusion output to robot action space.
+
+    Mirrors the FinalLayer design in RDT (RmsNorm -> MLP) and DexVLA
+    (AdaLN -> Linear). Uses residual connection with zero-initialized
+    output layer so the head acts as identity when not fine-tuned.
+    """
+
+    def __init__(self, action_dim, hidden_dim=None):
+        super().__init__()
+        if hidden_dim is None:
+            hidden_dim = action_dim * 4
+        self.norm = nn.LayerNorm(action_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(action_dim, hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(hidden_dim, action_dim),
+        )
+        # Zero-initialize the last layer so residual output = identity at init
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, x):
+        """
+        Args:
+            x: (chunk_size, action_dim) raw action predictions
+
+        Returns:
+            Refined action predictions of same shape.
+        """
+        return x + self.mlp(self.norm(x))
+
+
 class AudioXRobot:
     """
     AudioX model adapted for robot action generation in RoboTwin.
@@ -52,7 +92,7 @@ class AudioXRobot:
       - Language instructions via T5 text encoder
       - Robot joint state as additional conditioning
 
-    Action output: [left_arm(7) + left_gripper(1) + right_arm(7) + right_gripper(1)] = 16 dims
+    Action output: [left_arm(N) + left_gripper(1) + right_arm(N) + right_gripper(1)]
     """
 
     def __init__(
@@ -61,11 +101,14 @@ class AudioXRobot:
         ckpt_path,
         action_dim=16,
         action_chunk_size=50,
+        left_arm_dim=6,
+        right_arm_dim=6,
         img_size=(224, 224),
         device="cuda",
         use_half=False,
         pretrained_name=None,
         action_stats_path=None,
+        action_head_path=None,
     ):
         """
         Args:
@@ -73,17 +116,27 @@ class AudioXRobot:
             ckpt_path: Path to fine-tuned checkpoint (.ckpt or .safetensors).
             action_dim: Robot action dimension (default 16 for dual-arm).
             action_chunk_size: Number of action steps to predict per inference.
+            left_arm_dim: Number of joint DOFs for the left arm (excluding gripper).
+            right_arm_dim: Number of joint DOFs for the right arm (excluding gripper).
             img_size: Input image size for vision encoder.
             device: Device to run inference on.
             use_half: Whether to use fp16 inference.
             pretrained_name: HuggingFace pretrained model name (alternative to config+ckpt).
             action_stats_path: Path to action normalization stats (.pt file from training).
+            action_head_path: Path to pre-trained ActionHead weights (.pt).
         """
         self.action_dim = action_dim
         self.action_chunk_size = action_chunk_size
+        self.left_arm_dim = left_arm_dim
+        self.right_arm_dim = right_arm_dim
         self.img_size = img_size
         self.device = device
         self.use_half = use_half
+
+        # Gripper dimension indices within the action vector
+        # Layout: [left_arm(N), left_gripper(1), right_arm(N), right_gripper(1)]
+        self.left_gripper_idx = left_arm_dim
+        self.right_gripper_idx = left_arm_dim + 1 + right_arm_dim
 
         # Load model
         if pretrained_name is not None:
@@ -114,8 +167,23 @@ class AudioXRobot:
             self.action_stats = torch.load(action_stats_path, map_location="cpu")
             print(f"[AudioX] Loaded action stats from {action_stats_path}")
 
+        # Initialize ActionHead (LayerNorm + MLP) for output projection
+        self.action_head = ActionHead(action_dim).to(self.device)
+        if action_head_path is not None and os.path.exists(action_head_path):
+            head_state = torch.load(action_head_path, map_location=self.device)
+            self.action_head.load_state_dict(head_state)
+            print(f"[AudioX] Loaded action head from {action_head_path}")
+        else:
+            print("[AudioX] ActionHead initialized (identity mode, no pre-trained weights)")
+        self.action_head.eval()
+
+        # Precompute CLIP normalization tensors
+        self._clip_mean = torch.tensor(CLIP_IMAGE_MEAN).view(3, 1, 1)
+        self._clip_std = torch.tensor(CLIP_IMAGE_STD).view(3, 1, 1)
+
         print(f"[AudioX] Model loaded successfully on {self.device}")
         print(f"[AudioX] Action dim: {self.action_dim}, Chunk size: {self.action_chunk_size}")
+        print(f"[AudioX] Arm config: left={self.left_arm_dim}, right={self.right_arm_dim}")
 
     def _load_checkpoint(self, ckpt_path):
         """Load model weights from checkpoint file."""
@@ -142,16 +210,11 @@ class AudioXRobot:
 
         Args:
             img_arr: List of 3 camera images [head, right, left] as numpy arrays (H, W, 3).
-            state: Robot joint state vector (16-dim).
+            state: Robot joint state vector.
         """
-        img_head = img_arr[0]
-        img_right = img_arr[1]
-        img_left = img_arr[2]
-
-        # Resize images to target size
-        img_head = self._preprocess_image(img_head)
-        img_right = self._preprocess_image(img_right)
-        img_left = self._preprocess_image(img_left)
+        img_head = self._preprocess_image(img_arr[0])
+        img_right = self._preprocess_image(img_arr[1])
+        img_left = self._preprocess_image(img_arr[2])
 
         self.observation_window = {
             "images": {
@@ -164,7 +227,7 @@ class AudioXRobot:
         }
 
     def _preprocess_image(self, img):
-        """Preprocess a single image: resize and normalize."""
+        """Preprocess a single image: resize to target size."""
         if img.shape[:2] != self.img_size:
             img = cv2.resize(img, (self.img_size[1], self.img_size[0]), interpolation=cv2.INTER_LINEAR)
         return img
@@ -173,16 +236,18 @@ class AudioXRobot:
         """
         Prepare video conditioning input for AudioX's CLIP conditioner.
 
-        Converts camera images to video tensor format expected by AudioX.
-        The CLIP conditioner expects video frames as tensors.
+        Converts camera images to properly normalized video tensor
+        expected by CLIP-ViT-B/32.
         """
         frames = []
         for key in ["head", "left_wrist", "right_wrist"]:
             img = images_dict[key]
-            # Convert BGR to RGB if needed, then to tensor
+            # Convert to float [0, 1]
             if img.dtype == np.uint8:
                 img = img.astype(np.float32) / 255.0
             img_tensor = torch.from_numpy(img).permute(2, 0, 1)  # (3, H, W)
+            # Apply CLIP normalization: (x - mean) / std
+            img_tensor = (img_tensor - self._clip_mean) / self._clip_std
             frames.append(img_tensor)
 
         # Stack frames as a video sequence: (num_frames, C, H, W)
@@ -194,6 +259,7 @@ class AudioXRobot:
         Prepare all conditioning inputs for the AudioX model.
 
         Returns conditioning dict compatible with AudioX's MultiConditioner.
+        Keys must match the conditioner `id` fields in the config.
         """
         assert self.observation_window is not None, "Must call update_observation_window first!"
 
@@ -203,13 +269,14 @@ class AudioXRobot:
         if self.instruction is not None:
             conditioning["prompt"] = self.instruction
 
-        # Video conditioning (camera images as video frames)
+        # Video conditioning (camera images as CLIP-normalized video frames)
         video_tensor = self._prepare_video_conditioning(self.observation_window["images"])
         conditioning["video"] = video_tensor
 
-        # State conditioning (robot joint state)
+        # Proprioceptive state conditioning
+        # Key must be "proprio" to match config conditioner id
         state = self.observation_window["state"]
-        conditioning["state"] = state
+        conditioning["proprio"] = state
 
         return conditioning
 
@@ -218,6 +285,14 @@ class AudioXRobot:
         """
         Generate robot actions using AudioX diffusion inference.
 
+        Pipeline:
+          1. Prepare conditioning (text + video + proprio)
+          2. Run diffusion sampling → raw output (batch, action_dim, chunk_size)
+          3. Transpose to robot convention (chunk_size, action_dim)
+          4. Apply ActionHead (LayerNorm + MLP) for action-space projection
+          5. Denormalize from training normalization back to real joint angles
+          6. Clamp gripper values to valid range [0, 1]
+
         Returns:
             actions: numpy array of shape (action_chunk_size, action_dim)
         """
@@ -225,42 +300,40 @@ class AudioXRobot:
 
         conditioning = self._prepare_conditioning()
 
-        # Prepare conditioning for AudioX's generate_diffusion_cond
-        conditioning_list = [conditioning]
-
-        # Generate actions through diffusion process
+        # Step 1: Run diffusion sampling
+        # generate_diffusion_cond outputs audio-format tensor: (batch, channels, length)
+        # For robotics: channels = action_dim, length = chunk_size
         output = generate_diffusion_cond(
             self.model,
-            conditioning=conditioning_list,
+            conditioning=[conditioning],
             sample_size=self.sample_size,
             sample_rate=self.sample_rate,
             device=self.device,
             seed=None,
         )
 
-        # Post-process: reshape output to action sequence
-        # Output from diffusion: (batch, channels, length)
+        # Step 2: Transpose from audio layout (action_dim, chunk_size) to robot layout (chunk_size, action_dim)
         if isinstance(output, torch.Tensor):
-            actions = output.squeeze(0).cpu().numpy()
+            # output: (batch, action_dim, chunk_size)
+            actions = output.squeeze(0)  # (action_dim, chunk_size)
         else:
-            actions = np.array(output)
+            actions = torch.tensor(output, dtype=torch.float32).squeeze(0)
 
-        # Reshape to (chunk_size, action_dim)
-        if actions.ndim == 1:
-            actions = actions.reshape(-1, self.action_dim)
-        elif actions.ndim == 2 and actions.shape[0] != self.action_chunk_size:
-            # Transpose if needed (channels, length) -> (length, channels)
-            if actions.shape[0] == self.action_dim:
-                actions = actions.T
-            actions = actions[:self.action_chunk_size]
-
+        actions = actions.T  # (chunk_size, action_dim)
         actions = actions[:self.action_chunk_size]
 
-        # Denormalize actions from normalized space back to real joint angles
+        # Step 3: Apply ActionHead (LayerNorm + MLP projection)
+        actions = actions.to(self.device)
+        actions = self.action_head(actions)
+
+        # Step 4: Denormalize from normalized space to real joint angles
         if self.action_stats is not None:
             actions = self._denormalize_actions(actions)
 
-        return actions
+        # Step 5: Clamp gripper values to valid range [0, 1]
+        actions = self._clamp_gripper(actions)
+
+        return actions.cpu().numpy()
 
     def _denormalize_actions(self, actions):
         """
@@ -271,27 +344,37 @@ class AudioXRobot:
           - mean/std stats: action = normalized * std + mean
 
         Args:
-            actions: numpy array of shape (chunk_size, action_dim) in normalized space.
+            actions: tensor of shape (chunk_size, action_dim) in normalized space.
 
         Returns:
-            Denormalized actions in real joint angle space.
+            Denormalized actions tensor in real joint angle space.
         """
         stats = self.action_stats
         if "action_min" in stats and "action_max" in stats:
-            a_min = stats["action_min"].numpy()
-            a_max = stats["action_max"].numpy()
-            # Ensure broadcastable to (chunk_size, action_dim)
-            if a_min.ndim == 1:
-                a_min = a_min[:self.action_dim]
-                a_max = a_max[:self.action_dim]
+            a_min = stats["action_min"][:self.action_dim].to(actions.device)
+            a_max = stats["action_max"][:self.action_dim].to(actions.device)
             actions = (actions + 1.0) / 2.0 * (a_max - a_min) + a_min
         elif "action_mean" in stats and "action_std" in stats:
-            a_mean = stats["action_mean"].numpy()
-            a_std = stats["action_std"].numpy()
-            if a_mean.ndim == 1:
-                a_mean = a_mean[:self.action_dim]
-                a_std = a_std[:self.action_dim]
+            a_mean = stats["action_mean"][:self.action_dim].to(actions.device)
+            a_std = stats["action_std"][:self.action_dim].to(actions.device)
             actions = actions * a_std + a_mean
+        return actions
+
+    def _clamp_gripper(self, actions):
+        """
+        Clamp gripper dimensions to valid range [0, 1].
+
+        Joint angles are unconstrained, but gripper open/close values
+        must be within [0, 1] for the robot hardware.
+
+        Args:
+            actions: tensor of shape (chunk_size, action_dim)
+
+        Returns:
+            Actions with gripper values clamped.
+        """
+        actions[:, self.left_gripper_idx] = actions[:, self.left_gripper_idx].clamp(0.0, 1.0)
+        actions[:, self.right_gripper_idx] = actions[:, self.right_gripper_idx].clamp(0.0, 1.0)
         return actions
 
     def reset(self):

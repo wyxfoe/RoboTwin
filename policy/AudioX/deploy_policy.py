@@ -21,6 +21,13 @@ sys.path.append(parent_directory)
 from audiox_model import AudioXRobot
 
 
+def _resolve_path(path):
+    """Resolve a path relative to the policy directory if not absolute."""
+    if path is not None and not os.path.isabs(path):
+        return os.path.join(parent_directory, path)
+    return path
+
+
 def encode_obs(observation):
     """
     Post-process RoboTwin observation into format for AudioX.
@@ -37,17 +44,17 @@ def encode_obs(observation):
                     "right_camera": {"rgb": np.ndarray},
                 },
                 "joint_action": {
-                    "left_arm": [7 floats],
+                    "left_arm": [N floats],
                     "left_gripper": float,
-                    "right_arm": [7 floats],
+                    "right_arm": [N floats],
                     "right_gripper": float,
-                    "vector": [16 floats],
+                    "vector": [action_dim floats],
                 }
             }
 
     Returns:
         input_rgb_arr: List of 3 camera images [head, right, left].
-        input_state: 16-dim joint state vector.
+        input_state: Joint state vector.
     """
     input_rgb_arr = [
         observation["observation"]["head_camera"]["rgb"],
@@ -72,28 +79,29 @@ def get_model(usr_args):
                 - pretrained_name: HuggingFace pretrained name (alternative).
                 - action_dim: Action dimension (default 16).
                 - action_chunk_size: Steps per inference (default 50).
+                - left_arm_dim: Left arm DOFs (default 6, set by eval framework).
+                - right_arm_dim: Right arm DOFs (default 6, set by eval framework).
                 - img_size: Input image size (default 224).
                 - use_half: Use fp16 (default False).
+                - action_stats_path: Path to action normalization stats.
+                - action_head_path: Path to pre-trained ActionHead weights.
 
     Returns:
         AudioXRobot model instance.
     """
-    model_config = usr_args.get("model_config", None)
-    ckpt_path = usr_args.get("ckpt_path", None)
+    model_config = _resolve_path(usr_args.get("model_config", None))
+    ckpt_path = _resolve_path(usr_args.get("ckpt_path", None))
     pretrained_name = usr_args.get("pretrained_name", None)
-
-    # Resolve paths relative to policy directory if not absolute
-    if model_config is not None and not os.path.isabs(model_config):
-        model_config = os.path.join(parent_directory, model_config)
-    if ckpt_path is not None and not os.path.isabs(ckpt_path):
-        ckpt_path = os.path.join(parent_directory, ckpt_path)
-
-    action_stats_path = usr_args.get("action_stats_path", None)
-    if action_stats_path is not None and not os.path.isabs(action_stats_path):
-        action_stats_path = os.path.join(parent_directory, action_stats_path)
+    action_stats_path = _resolve_path(usr_args.get("action_stats_path", None))
+    action_head_path = _resolve_path(usr_args.get("action_head_path", None))
 
     action_dim = usr_args.get("action_dim", 16)
     action_chunk_size = usr_args.get("action_chunk_size", 50)
+
+    # Arm dimensions from the eval framework (eval_policy.py sets these from embodiment config)
+    left_arm_dim = usr_args.get("left_arm_dim", 6)
+    right_arm_dim = usr_args.get("right_arm_dim", 6)
+
     img_size_val = usr_args.get("img_size", 224)
     if isinstance(img_size_val, int):
         img_size = (img_size_val, img_size_val)
@@ -107,11 +115,14 @@ def get_model(usr_args):
         ckpt_path=ckpt_path,
         action_dim=action_dim,
         action_chunk_size=action_chunk_size,
+        left_arm_dim=left_arm_dim,
+        right_arm_dim=right_arm_dim,
         img_size=img_size,
         device="cuda",
         use_half=use_half,
         pretrained_name=pretrained_name,
         action_stats_path=action_stats_path,
+        action_head_path=action_head_path,
     )
 
     return model
