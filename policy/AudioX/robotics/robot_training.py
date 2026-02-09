@@ -129,6 +129,9 @@ class RobotDiffusionTrainingWrapper(pl.LightningModule):
 
         - T5, trajectory: processed via AudioX conditioners as usual
         - Video: each camera independently through CLIP, then token concatenation
+
+        Note: AudioX's TrajectoryConditioner may not call proj_out internally,
+        so we apply it here if the output dim doesn't match output_dim.
         """
         conditioner = self.diffusion.conditioner
         conditioning = {}
@@ -139,6 +142,15 @@ class RobotDiffusionTrainingWrapper(pl.LightningModule):
                 continue
             inputs = [m[key] for m in metadata]
             conditioning[key] = cond_module(inputs, self.device)
+
+            # Fix for conditioners that don't call proj_out internally
+            # (e.g. TrajectoryConditioner outputs dim instead of output_dim)
+            features, mask = conditioning[key]
+            if (hasattr(cond_module, 'proj_out') and
+                    hasattr(cond_module, 'output_dim') and
+                    features.shape[-1] != cond_module.output_dim):
+                features = cond_module.proj_out(features)
+                conditioning[key] = [features, mask]
 
         # RDT-style: independent CLIP per camera, concatenate tokens
         conditioning["video"] = self._encode_images_clip(metadata)
