@@ -178,49 +178,7 @@ class RobotDiffusionTrainingWrapper(pl.LightningModule):
                 )
                 conditioning = null_cond
 
-        # Debug: print shapes on first step
-        if batch_idx == 0:
-            print(f"\n[DEBUG] cross_attn_cond_ids: {self.diffusion.cross_attn_cond_ids}")
-            print(f"[DEBUG] global_cond_ids: {self.diffusion.global_cond_ids}")
-            print(f"[DEBUG] actions shape: {actions.shape}")
-            # Print DiffusionTransformer internal state
-            dit = self.diffusion.model.model  # DiffusionTransformer
-            print(f"[DEBUG] DiffusionTransformer.cond_token_dim: {dit.cond_token_dim}")
-            print(f"[DEBUG] to_cond_embed: {dit.to_cond_embed}")
-            # Print first cross-attention module details
-            for li, layer in enumerate(dit.transformer.layers):
-                if hasattr(layer, 'cross_attn'):
-                    ca = layer.cross_attn
-                    print(f"[DEBUG] Layer {li} cross_attn:")
-                    print(f"  num_heads={ca.num_heads}, kv_heads={ca.kv_heads}, dim_heads={ca.dim_heads}")
-                    if hasattr(ca, 'to_kv'):
-                        print(f"  to_kv: {ca.to_kv}")
-                        print(f"  to_kv.weight.shape: {ca.to_kv.weight.shape}")
-                    if hasattr(ca, 'to_q'):
-                        print(f"  to_q.weight.shape: {ca.to_q.weight.shape}")
-                    break
-            for k, v in conditioning.items():
-                feat, msk = v
-                print(f"[DEBUG] conditioning['{k}']: feat={feat.shape}, mask={msk.shape}, dtype={feat.dtype}")
-
         cond_inputs = self.diffusion.get_conditioning_inputs(conditioning)
-
-        # Debug: print cond_inputs shapes on first step
-        if batch_idx == 0:
-            for k, v in cond_inputs.items():
-                if v is not None:
-                    print(f"[DEBUG] cond_inputs['{k}']: shape={v.shape}, dtype={v.dtype}")
-                else:
-                    print(f"[DEBUG] cond_inputs['{k}']: None")
-
-            # Monkey-patch SDPA to print q/k/v shapes
-            _orig_sdpa = F.scaled_dot_product_attention
-            _sdpa_call = [0]
-            def _debug_sdpa(q, k, v, attn_mask=None, **kw):
-                _sdpa_call[0] += 1
-                print(f"[DEBUG] SDPA call #{_sdpa_call[0]}: q={q.shape}, k={k.shape}, v={v.shape}, mask={'None' if attn_mask is None else attn_mask.shape}")
-                return _orig_sdpa(q, k, v, attn_mask=attn_mask, **kw)
-            F.scaled_dot_product_attention = _debug_sdpa
 
         # --- Diffusion noise ---
         t = self._sample_timesteps(batch_size)
@@ -236,16 +194,11 @@ class RobotDiffusionTrainingWrapper(pl.LightningModule):
         targets = noise * alphas - actions * sigmas
 
         # --- Forward ---
-        try:
-            output = self.diffusion.model(
-                noised_actions,
-                t,
-                **cond_inputs,
-            )
-        finally:
-            # Restore original SDPA after first step debug
-            if batch_idx == 0:
-                F.scaled_dot_product_attention = _orig_sdpa
+        output = self.diffusion.model(
+            noised_actions,
+            t,
+            **cond_inputs,
+        )
 
         loss = F.mse_loss(output, targets)
 

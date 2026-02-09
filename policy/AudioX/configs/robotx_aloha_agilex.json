@@ -18,7 +18,7 @@
                 "patch_size": 1,
                 "embed_dim": 512,
                 "cond_token_dim": 768,
-                "project_cond_tokens": false,
+                "project_cond_tokens": true,
                 "global_cond_dim": 0,
                 "depth": 8,
                 "num_heads": 8,
