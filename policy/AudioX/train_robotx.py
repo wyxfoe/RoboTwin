@@ -41,14 +41,12 @@ from pytorch_lightning.loggers import WandbLogger
 # 添加项目路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from stable_audio_tools.robotics.robot_model import create_robot_model_from_config
-from stable_audio_tools.robotics.robot_training import (
+from robotics.robot_model import create_robot_model_from_config
+from robotics.robot_training import (
     RobotDiffusionTrainingWrapper,
     RobotDemoCallback,
 )
-from stable_audio_tools.robotics.robotwin_dataset import (
-    create_robotwin_dataloader,
-)
+from robotics.robotwin_dataset import create_robotwin_dataloader
 
 
 def main():
