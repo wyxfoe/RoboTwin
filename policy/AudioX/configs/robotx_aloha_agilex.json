@@ -17,7 +17,7 @@
                 "io_channels": 14,
                 "patch_size": 1,
                 "embed_dim": 512,
-                "cond_token_dim": 512,
+                "cond_token_dim": 768,
                 "project_cond_tokens": true,
                 "global_cond_dim": 0,
                 "depth": 8,
@@ -27,7 +27,7 @@
             }
         },
         "conditioning": {
-            "cond_dim": 512,
+            "cond_dim": 768,
             "configs": [
                 {
                     "id": "prompt",
