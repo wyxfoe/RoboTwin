@@ -197,6 +197,15 @@ class RobotDiffusionTrainingWrapper(pl.LightningModule):
                 else:
                     print(f"[DEBUG] cond_inputs['{k}']: None")
 
+            # Monkey-patch SDPA to print q/k/v shapes
+            _orig_sdpa = F.scaled_dot_product_attention
+            _sdpa_call = [0]
+            def _debug_sdpa(q, k, v, attn_mask=None, **kw):
+                _sdpa_call[0] += 1
+                print(f"[DEBUG] SDPA call #{_sdpa_call[0]}: q={q.shape}, k={k.shape}, v={v.shape}, mask={'None' if attn_mask is None else attn_mask.shape}")
+                return _orig_sdpa(q, k, v, attn_mask=attn_mask, **kw)
+            F.scaled_dot_product_attention = _debug_sdpa
+
         # --- Diffusion noise ---
         t = self._sample_timesteps(batch_size)
         alphas, sigmas = _get_alphas_sigmas(t)
@@ -211,11 +220,16 @@ class RobotDiffusionTrainingWrapper(pl.LightningModule):
         targets = noise * alphas - actions * sigmas
 
         # --- Forward ---
-        output = self.diffusion.model(
-            noised_actions,
-            t,
-            **cond_inputs,
-        )
+        try:
+            output = self.diffusion.model(
+                noised_actions,
+                t,
+                **cond_inputs,
+            )
+        finally:
+            # Restore original SDPA after first step debug
+            if batch_idx == 0:
+                F.scaled_dot_product_attention = _orig_sdpa
 
         loss = F.mse_loss(output, targets)
 
