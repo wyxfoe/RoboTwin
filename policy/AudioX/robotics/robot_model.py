@@ -32,35 +32,24 @@ from stable_audio_tools.models.factory import create_model_from_config
 def create_robot_model_from_config(config):
     """Create an AudioX diffusion model from a robotics config dict.
 
-    Our JSON uses a nested layout for readability::
-
-        model.diffusion.type / model.diffusion.config / model.conditioning
-
-    AudioX's factory expects a flat layout::
-
-        model_type = "diffusion_cond"
-        model.type / model.config / model.conditioning
-
-    This function bridges the two.
+    AudioX factory expects certain fields at the top level (io_channels,
+    sample_rate, sample_size) that our robotics config stores inside
+    model.diffusion.config.  This function copies them up.
     """
     import copy
     factory_config = copy.deepcopy(config)
 
-    # 1. model_type: 'robot_diffusion' -> AudioX's 'diffusion_cond'
+    # model_type: 'robot_diffusion' -> AudioX's 'diffusion_cond'
     if factory_config.get("model_type") == "robot_diffusion":
         factory_config["model_type"] = "diffusion_cond"
 
-    # 2. Flatten model.diffusion.* up into model.*
-    model_section = factory_config.get("model", {})
-    diffusion_section = model_section.pop("diffusion", None)
-    if diffusion_section is not None:
-        model_section.update(diffusion_section)
-        factory_config["model"] = model_section
+    # AudioX factory reads io_channels from the top level
+    diff_cfg = factory_config.get("model", {}).get("diffusion", {}).get("config", {})
+    factory_config.setdefault("io_channels", diff_cfg.get("io_channels"))
 
-    # 3. Add AudioX audio fields if missing
-    chunk_size = config.get("action_chunk_size", 50)
+    # Audio-specific fields (robotics defaults)
     factory_config.setdefault("sample_rate", 1)
-    factory_config.setdefault("sample_size", chunk_size)
+    factory_config.setdefault("sample_size", config.get("action_chunk_size", 50))
 
     model = create_model_from_config(factory_config)
     model._config = config
