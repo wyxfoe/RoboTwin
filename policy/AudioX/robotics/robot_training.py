@@ -119,7 +119,8 @@ class RobotDiffusionTrainingWrapper(pl.LightningModule):
 
         # Concatenate all cameras: (B, num_cams * num_tokens, hidden_dim)
         concat_features = torch.cat(all_features, dim=1)
-        mask = torch.ones(batch_size, 1).to(self.device)
+        # Mask must match token count for cross-attention
+        mask = torch.ones(batch_size, concat_features.shape[1]).to(self.device)
 
         return [concat_features, mask]
 

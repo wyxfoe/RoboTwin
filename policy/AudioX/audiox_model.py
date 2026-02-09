@@ -281,7 +281,7 @@ class AudioXRobot:
 
         # Concatenate all cameras: (1, num_cams * num_tokens, hidden_dim)
         concat_features = torch.cat(all_features, dim=1)
-        mask = torch.ones(1, 1).to(self.device)
+        mask = torch.ones(1, concat_features.shape[1]).to(self.device)
 
         return [concat_features, mask]
 
