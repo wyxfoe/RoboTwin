@@ -88,6 +88,10 @@ def get_model(usr_args):
     if ckpt_path is not None and not os.path.isabs(ckpt_path):
         ckpt_path = os.path.join(parent_directory, ckpt_path)
 
+    action_stats_path = usr_args.get("action_stats_path", None)
+    if action_stats_path is not None and not os.path.isabs(action_stats_path):
+        action_stats_path = os.path.join(parent_directory, action_stats_path)
+
     action_dim = usr_args.get("action_dim", 16)
     action_chunk_size = usr_args.get("action_chunk_size", 50)
     img_size_val = usr_args.get("img_size", 224)
@@ -107,6 +111,7 @@ def get_model(usr_args):
         device="cuda",
         use_half=use_half,
         pretrained_name=pretrained_name,
+        action_stats_path=action_stats_path,
     )
 
     return model

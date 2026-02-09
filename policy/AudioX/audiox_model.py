@@ -65,6 +65,7 @@ class AudioXRobot:
         device="cuda",
         use_half=False,
         pretrained_name=None,
+        action_stats_path=None,
     ):
         """
         Args:
@@ -76,6 +77,7 @@ class AudioXRobot:
             device: Device to run inference on.
             use_half: Whether to use fp16 inference.
             pretrained_name: HuggingFace pretrained model name (alternative to config+ckpt).
+            action_stats_path: Path to action normalization stats (.pt file from training).
         """
         self.action_dim = action_dim
         self.action_chunk_size = action_chunk_size
@@ -105,6 +107,12 @@ class AudioXRobot:
         # Extract sample rate and sample size from config if available
         self.sample_rate = self.model_config.get("sample_rate", 1)
         self.sample_size = self.model_config.get("sample_size", self.action_chunk_size * self.action_dim)
+
+        # Load action normalization statistics for denormalization
+        self.action_stats = None
+        if action_stats_path is not None and os.path.exists(action_stats_path):
+            self.action_stats = torch.load(action_stats_path, map_location="cpu")
+            print(f"[AudioX] Loaded action stats from {action_stats_path}")
 
         print(f"[AudioX] Model loaded successfully on {self.device}")
         print(f"[AudioX] Action dim: {self.action_dim}, Chunk size: {self.action_chunk_size}")
@@ -246,7 +254,45 @@ class AudioXRobot:
                 actions = actions.T
             actions = actions[:self.action_chunk_size]
 
-        return actions[:self.action_chunk_size]
+        actions = actions[:self.action_chunk_size]
+
+        # Denormalize actions from normalized space back to real joint angles
+        if self.action_stats is not None:
+            actions = self._denormalize_actions(actions)
+
+        return actions
+
+    def _denormalize_actions(self, actions):
+        """
+        Denormalize actions from [-1, 1] back to real joint angle space.
+
+        Supports two normalization conventions:
+          - min/max stats: action = (normalized + 1) / 2 * (max - min) + min
+          - mean/std stats: action = normalized * std + mean
+
+        Args:
+            actions: numpy array of shape (chunk_size, action_dim) in normalized space.
+
+        Returns:
+            Denormalized actions in real joint angle space.
+        """
+        stats = self.action_stats
+        if "action_min" in stats and "action_max" in stats:
+            a_min = stats["action_min"].numpy()
+            a_max = stats["action_max"].numpy()
+            # Ensure broadcastable to (chunk_size, action_dim)
+            if a_min.ndim == 1:
+                a_min = a_min[:self.action_dim]
+                a_max = a_max[:self.action_dim]
+            actions = (actions + 1.0) / 2.0 * (a_max - a_min) + a_min
+        elif "action_mean" in stats and "action_std" in stats:
+            a_mean = stats["action_mean"].numpy()
+            a_std = stats["action_std"].numpy()
+            if a_mean.ndim == 1:
+                a_mean = a_mean[:self.action_dim]
+                a_std = a_std[:self.action_dim]
+            actions = actions * a_std + a_mean
+        return actions
 
     def reset(self):
         """Reset model state between evaluation episodes."""

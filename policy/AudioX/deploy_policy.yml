@@ -14,6 +14,9 @@ ckpt_path: null       # Path to fine-tuned checkpoint (.ckpt or .safetensors)
 # Option 2: Load from HuggingFace pretrained (for base model)
 pretrained_name: null  # e.g., "HKUSTAudio/AudioX"
 
+# Action normalization stats (saved during training by train_robotx.py)
+action_stats_path: null  # Path to action_stats.pt for denormalization (e.g., "checkpoints/robotx/action_stats.pt")
+
 # Action generation parameters
 action_dim: 16         # Robot action dimension: left_arm(7) + left_gripper(1) + right_arm(7) + right_gripper(1)
 action_chunk_size: 50  # Number of action steps per diffusion inference
