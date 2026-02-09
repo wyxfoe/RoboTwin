@@ -34,6 +34,8 @@ class EMA:
     def update(self, model):
         for k, v in model.state_dict().items():
             if k in self.shadow:
+                if self.shadow[k].device != v.device:
+                    self.shadow[k] = self.shadow[k].to(v.device)
                 self.shadow[k].mul_(self.decay).add_(v, alpha=1.0 - self.decay)
 
     def apply(self, model):
