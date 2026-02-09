@@ -183,6 +183,22 @@ class RobotDiffusionTrainingWrapper(pl.LightningModule):
             print(f"\n[DEBUG] cross_attn_cond_ids: {self.diffusion.cross_attn_cond_ids}")
             print(f"[DEBUG] global_cond_ids: {self.diffusion.global_cond_ids}")
             print(f"[DEBUG] actions shape: {actions.shape}")
+            # Print DiffusionTransformer internal state
+            dit = self.diffusion.model.model  # DiffusionTransformer
+            print(f"[DEBUG] DiffusionTransformer.cond_token_dim: {dit.cond_token_dim}")
+            print(f"[DEBUG] to_cond_embed: {dit.to_cond_embed}")
+            # Print first cross-attention module details
+            for li, layer in enumerate(dit.transformer.layers):
+                if hasattr(layer, 'cross_attn'):
+                    ca = layer.cross_attn
+                    print(f"[DEBUG] Layer {li} cross_attn:")
+                    print(f"  num_heads={ca.num_heads}, kv_heads={ca.kv_heads}, dim_heads={ca.dim_heads}")
+                    if hasattr(ca, 'to_kv'):
+                        print(f"  to_kv: {ca.to_kv}")
+                        print(f"  to_kv.weight.shape: {ca.to_kv.weight.shape}")
+                    if hasattr(ca, 'to_q'):
+                        print(f"  to_q.weight.shape: {ca.to_q.weight.shape}")
+                    break
             for k, v in conditioning.items():
                 feat, msk = v
                 print(f"[DEBUG] conditioning['{k}']: feat={feat.shape}, mask={msk.shape}, dtype={feat.dtype}")
