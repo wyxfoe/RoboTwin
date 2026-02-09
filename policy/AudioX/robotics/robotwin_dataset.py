@@ -164,7 +164,9 @@ class RoboTwinDataset(Dataset):
         actions_t = actions_t.T  # (action_dim, chunk_size)
 
         # Build metadata dict for conditioner
-        video_tensor = torch.from_numpy(np.stack(frames, axis=0))  # (num_cams, C, H, W)
+        # AudioX CLIPConditioner expects (1, num_frames, C, H, W) per sample;
+        # it concatenates along dim=0 across the batch to get (B, T, C, H, W).
+        video_tensor = torch.from_numpy(np.stack(frames, axis=0)).unsqueeze(0)  # (1, num_cams, C, H, W)
         proprio_tensor = torch.from_numpy(proprio)
 
         metadata = {
