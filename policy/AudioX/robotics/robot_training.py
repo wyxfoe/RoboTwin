@@ -178,7 +178,24 @@ class RobotDiffusionTrainingWrapper(pl.LightningModule):
                 )
                 conditioning = null_cond
 
+        # Debug: print shapes on first step
+        if batch_idx == 0:
+            print(f"\n[DEBUG] cross_attn_cond_ids: {self.diffusion.cross_attn_cond_ids}")
+            print(f"[DEBUG] global_cond_ids: {self.diffusion.global_cond_ids}")
+            print(f"[DEBUG] actions shape: {actions.shape}")
+            for k, v in conditioning.items():
+                feat, msk = v
+                print(f"[DEBUG] conditioning['{k}']: feat={feat.shape}, mask={msk.shape}, dtype={feat.dtype}")
+
         cond_inputs = self.diffusion.get_conditioning_inputs(conditioning)
+
+        # Debug: print cond_inputs shapes on first step
+        if batch_idx == 0:
+            for k, v in cond_inputs.items():
+                if v is not None:
+                    print(f"[DEBUG] cond_inputs['{k}']: shape={v.shape}, dtype={v.dtype}")
+                else:
+                    print(f"[DEBUG] cond_inputs['{k}']: None")
 
         # --- Diffusion noise ---
         t = self._sample_timesteps(batch_size)
