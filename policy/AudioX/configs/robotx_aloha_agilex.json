@@ -89,8 +89,8 @@
         }
     },
     "dataset": {
-        "data_dir": "/home/wyx/Beijingwork/RoboTwin/data/beat_block_hammer/demo_clean_500",
-        "task_description": "use the hammer to beat the block",
+        "data_dir": "data/task_name/demo_clean_500",
+        "task_description": "complete the task",
         "camera_names": ["front_camera", "head_camera", "left_camera", "right_camera"],
         "action_chunk_size": 50,
         "image_size": 224,

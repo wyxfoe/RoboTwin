@@ -269,6 +269,12 @@ def main():
     training_wrapper.export_model(final_path, use_safetensors=False)
     print(f"\nExported final model to {final_path}")
 
+    # Export ActionHead weights (if trained jointly)
+    if hasattr(training_wrapper, "action_head") and training_wrapper.action_head is not None:
+        head_path = os.path.join(args.save_dir, "action_head.pt")
+        torch.save(training_wrapper.action_head.state_dict(), head_path)
+        print(f"Exported ActionHead to {head_path}")
+
 
 if __name__ == "__main__":
     main()

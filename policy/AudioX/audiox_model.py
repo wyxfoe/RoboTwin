@@ -15,27 +15,33 @@ import torch.nn as nn
 import cv2
 from PIL import Image
 
-# Add AudioX- directory to Python path to find stable_audio_tools
+# Add AudioX source directory to Python path to find stable_audio_tools.
+# Resolution order:
+#   1. AUDIOX_PATH environment variable (explicit override)
+#   2. ../../../AudioX-  (sibling to RoboTwin project root)
+#   3. ../../AudioX-     (alternative layout)
 current_file_path = os.path.abspath(__file__)
 policy_dir = os.path.dirname(current_file_path)
-# AudioX- is typically at the same level as RoboTwin
-# Try multiple possible paths
-possible_audiox_paths = [
-    os.path.join(policy_dir, "../../../AudioX-"),  # From RoboTwin/policy/AudioX to AudioX-
-    os.path.join(policy_dir, "../../AudioX-"),    # Alternative path
-    "/home/wyx/Workspace/iros2026/AudioX-",        # Absolute path
+
+_audiox_search_paths = [
+    os.environ.get("AUDIOX_PATH", ""),
+    os.path.join(policy_dir, "../../../AudioX-"),
+    os.path.join(policy_dir, "../../AudioX-"),
 ]
 
-for audiox_path in possible_audiox_paths:
-    audiox_path = os.path.abspath(audiox_path)
-    if os.path.exists(audiox_path) and os.path.exists(os.path.join(audiox_path, "stable_audio_tools")):
-        if audiox_path not in sys.path:
-            sys.path.insert(0, audiox_path)
+for _p in _audiox_search_paths:
+    if not _p:
+        continue
+    _p = os.path.abspath(_p)
+    if os.path.isdir(os.path.join(_p, "stable_audio_tools")):
+        if _p not in sys.path:
+            sys.path.insert(0, _p)
         break
 else:
     raise ImportError(
-        f"Could not find AudioX- directory. Tried paths: {possible_audiox_paths}\n"
-        "Please ensure AudioX- is installed or add its path to PYTHONPATH."
+        "Cannot find AudioX source (stable_audio_tools).\n"
+        "Set the AUDIOX_PATH environment variable or place AudioX- beside the RoboTwin directory.\n"
+        f"Searched: {[os.path.abspath(p) for p in _audiox_search_paths if p]}"
     )
 
 from stable_audio_tools.models.factory import create_model_from_config
