@@ -20,43 +20,17 @@ import torch.nn as nn
 import cv2
 from PIL import Image
 
-# Add AudioX source directory to Python path to find stable_audio_tools.
-# Resolution order:
-#   1. AUDIOX_PATH environment variable (explicit override)
-#   2. ../../../AudioX-  (sibling to RoboTwin project root)
-#   3. ../../AudioX-     (alternative layout)
+# Ensure local robotics package is importable
 current_file_path = os.path.abspath(__file__)
 policy_dir = os.path.dirname(current_file_path)
-
-# Ensure local robotics package is importable
 if policy_dir not in sys.path:
     sys.path.insert(0, policy_dir)
 
-_audiox_search_paths = [
-    os.environ.get("AUDIOX_PATH", ""),
-    os.path.join(policy_dir, "../../../AudioX-"),
-    os.path.join(policy_dir, "../../AudioX-"),
-]
+# Official AudioX package (pip install -e /path/to/AudioX  or  pip install git+https://github.com/ZeyueT/AudioX.git)
+from audiox.models.pretrained import get_pretrained_model
+from audiox.inference.sampling import sample, sample_discrete_euler
 
-for _p in _audiox_search_paths:
-    if not _p:
-        continue
-    _p = os.path.abspath(_p)
-    if os.path.isdir(os.path.join(_p, "stable_audio_tools")):
-        if _p not in sys.path:
-            sys.path.insert(0, _p)
-        break
-else:
-    raise ImportError(
-        "Cannot find AudioX source (stable_audio_tools).\n"
-        "Set the AUDIOX_PATH environment variable or place AudioX- beside the RoboTwin directory.\n"
-        f"Searched: {[os.path.abspath(p) for p in _audiox_search_paths if p]}"
-    )
-
-from stable_audio_tools.models.pretrained import get_pretrained_model
-from stable_audio_tools.inference.sampling import sample
-
-# Use our robotics adapter that remaps config keys for AudioX factory
+# Our robotics adapters
 from robotics.robot_model import create_robot_model_from_config
 from robotics.finetune_model import AudioXFineTuneModel, create_finetune_model
 
@@ -395,14 +369,13 @@ class AudioXRobot:
 
         if self.model.diffusion_objective == "v":
             output = sample(
-                self.model.model, noise, steps=50, starting_t=0,
-                **cond_inputs, cfg_scale=3.0, batch_cfg=True,
+                self.model.model, noise, steps=50, eta=0,
+                **cond_inputs, cfg_scale=3.0,
             )
         else:
-            from stable_audio_tools.inference.sampling import sample_discrete_euler
             output = sample_discrete_euler(
                 self.model.model, noise, steps=50,
-                **cond_inputs, cfg_scale=3.0, batch_cfg=True,
+                **cond_inputs, cfg_scale=3.0,
             )
 
         # Step 3: Decode latent → actions (fine-tune mode only)

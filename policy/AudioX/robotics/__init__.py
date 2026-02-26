@@ -1,8 +1,9 @@
 """AudioX robotics training and inference utilities.
 
 Core modules (always available):
-    robot_model     — config adapter + model factory
+    robot_model     — config adapter + model factory (uses official audiox package)
     action_space    — action normalization / denormalization
+    conditioners    — TrajectoryConditioner + patched conditioner factory
     finetune_model  — AudioX 1.2B fine-tuning adapter layers + weight loading
 
 Training-only modules (require pytorch_lightning, h5py, cv2):
@@ -11,3 +12,4 @@ Training-only modules (require pytorch_lightning, h5py, cv2):
 """
 from .robot_model import create_robot_model_from_config
 from .action_space import normalize_actions, denormalize_actions
+from .conditioners import TrajectoryConditioner

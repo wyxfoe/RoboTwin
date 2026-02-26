@@ -20,7 +20,7 @@ import torch.nn.functional as F
 def _get_alphas_sigmas(t):
     """Cosine noise schedule: alpha(t)=cos(pi/2*t), sigma(t)=sin(pi/2*t).
 
-    Compatible with stable_audio_tools.inference.sampling.get_alphas_sigmas.
+    Compatible with audiox.inference.sampling.get_alphas_sigmas.
     """
     alphas = torch.cos(t * math.pi / 2)
     sigmas = torch.sin(t * math.pi / 2)
@@ -532,7 +532,7 @@ class RobotDemoCallback(pl.callbacks.Callback):
         n = min(self.num_demos, actions.shape[0])
 
         try:
-            from stable_audio_tools.inference.generation import generate_diffusion_cond
+            from audiox.inference.generation import generate_diffusion_cond
         except ImportError:
             return  # Skip if inference module unavailable
 

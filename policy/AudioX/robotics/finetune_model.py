@@ -18,29 +18,11 @@ are trained with normal LR while the DiT backbone uses a lower LR.
 
 import copy
 import os
-import sys
 
 import torch
 import torch.nn as nn
 
-# Ensure AudioX source is importable
-_policy_dir = os.path.dirname(os.path.abspath(__file__))
-_audiox_search_paths = [
-    os.environ.get("AUDIOX_PATH", ""),
-    os.path.join(_policy_dir, "../../../../AudioX-"),
-    os.path.join(_policy_dir, "../../../AudioX-"),
-    os.path.join(_policy_dir, "../../AudioX-"),
-]
-for _p in _audiox_search_paths:
-    if not _p:
-        continue
-    _p = os.path.abspath(_p)
-    if os.path.isdir(os.path.join(_p, "stable_audio_tools")):
-        if _p not in sys.path:
-            sys.path.insert(0, _p)
-        break
-
-from stable_audio_tools.models.factory import create_model_from_config
+from .robot_model import create_robot_model_from_config
 
 
 # ---------------------------------------------------------------------------
@@ -345,19 +327,9 @@ def create_finetune_model(config, audiox_ckpt_path=None):
         AudioXFineTuneModel instance.
     """
     # 1. Build the base AudioX model with 64 io_channels
-    factory_config = copy.deepcopy(config)
-    factory_config["model_type"] = "diffusion_cond"
-
-    model_cfg = factory_config.setdefault("model", {})
-    diff_cfg = model_cfg.get("diffusion", {}).get("config", {})
-    if "io_channels" not in model_cfg:
-        model_cfg["io_channels"] = diff_cfg.get("io_channels", config.get("latent_dim", 64))
-
-    factory_config.setdefault("sample_rate", 1)
-    factory_config.setdefault("sample_size", config.get("action_chunk_size", 50))
-
-    base_model = create_model_from_config(factory_config)
-    base_model._config = config
+    #    create_robot_model_from_config handles model_type remapping,
+    #    io_channels promotion, and robot-specific conditioners (trajectory)
+    base_model = create_robot_model_from_config(config)
 
     # 2. Wrap with adapter layers
     model = AudioXFineTuneModel(base_model, config)
