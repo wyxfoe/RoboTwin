@@ -2,6 +2,10 @@
 
 Implements v-prediction diffusion training with cosine noise schedule,
 classifier-free guidance dropout, and optional EMA.
+
+Includes both the original from-scratch wrapper (RobotDiffusionTrainingWrapper)
+and the fine-tuning wrapper (RobotFineTuneTrainingWrapper) that supports
+differential learning rates and AudioX pretrained weight reuse.
 """
 
 import copy
@@ -260,6 +264,251 @@ class RobotDiffusionTrainingWrapper(pl.LightningModule):
         else:
             torch.save(model_to_save.state_dict(), path)
         print(f"[Training] Exported model to {path}")
+
+
+class RobotFineTuneTrainingWrapper(pl.LightningModule):
+    """Lightning module for fine-tuning AudioX 1.2B on robot trajectories.
+
+    Differences from RobotDiffusionTrainingWrapper:
+      - Operates in 64-dim latent space (not 14-dim action space directly)
+      - Uses input_proj to map actions → latent before adding noise
+      - Adds reconstruction loss to train input_proj + output_proj jointly
+      - Supports differential learning rates:
+          * adapter_lr   for input_proj, output_proj, trajectory conditioner
+          * adapter_lr * dit_lr_scale   for DiT backbone
+          * T5, CLIP conditioners are frozen
+
+    Loss function:
+        L = L_diffusion + λ * L_reconstruction
+
+        L_diffusion:       MSE(v_predicted, v_target) in 64-dim latent space
+                           where v_target = α·ε − σ·x₀ (v-prediction objective)
+        L_reconstruction:  MSE(output_proj(input_proj(actions)), actions)
+                           ensures the adapter pair forms a coherent round-trip
+        λ:                 finetune_config["reconstruction_weight"] (default 0.1)
+    """
+
+    def __init__(
+        self,
+        model,
+        finetune_config=None,
+        use_ema=True,
+        log_loss_info=True,
+        cfg_dropout_prob=0.1,
+        timestep_sampler="logit_normal",
+        optimizer_configs=None,
+    ):
+        super().__init__()
+        self.diffusion = model  # AudioXFineTuneModel
+        self.finetune_config = finetune_config or {}
+        self.use_ema = use_ema
+        self.log_loss_info = log_loss_info
+        self.cfg_dropout_prob = cfg_dropout_prob
+        self.timestep_sampler = timestep_sampler
+        self.optimizer_configs = optimizer_configs or {}
+
+        self.recon_weight = self.finetune_config.get("reconstruction_weight", 0.1)
+
+        # EMA
+        self.ema = None
+        if use_ema:
+            self.ema = EMA(model, decay=0.999)
+
+    def _sample_timesteps(self, batch_size):
+        if self.timestep_sampler == "logit_normal":
+            u = torch.randn(batch_size, device=self.device)
+            t = torch.sigmoid(-0.4 + 1.2 * u)
+        else:
+            t = torch.rand(batch_size, device=self.device)
+        return t
+
+    @torch.no_grad()
+    def _encode_images_clip(self, metadata):
+        """RDT-style: each camera through CLIP independently, concatenate tokens."""
+        clip_cond = self.diffusion.conditioner.conditioners["video"]
+        clip_model = clip_cond.visual_encoder_model
+
+        batch_size = len(metadata)
+        num_cams = len(metadata[0]["camera_images"])
+        all_features = []
+
+        for cam_idx in range(num_cams):
+            cam_batch = torch.stack(
+                [m["camera_images"][cam_idx] for m in metadata]
+            ).to(self.device)
+            outputs = clip_model(pixel_values=cam_batch)
+            all_features.append(outputs.last_hidden_state)
+
+        concat_features = torch.cat(all_features, dim=1)
+        mask = torch.ones(batch_size, concat_features.shape[1]).to(self.device)
+        return [concat_features, mask]
+
+    def _build_conditioning(self, metadata):
+        """Build conditioning from metadata (same as parent class)."""
+        conditioner = self.diffusion.conditioner
+        conditioning = {}
+
+        for key, cond_module in conditioner.conditioners.items():
+            if key == "video":
+                continue
+            inputs = [m[key] for m in metadata]
+            conditioning[key] = cond_module(inputs, self.device)
+
+            features, mask = conditioning[key]
+            if (hasattr(cond_module, 'proj_out') and
+                    hasattr(cond_module, 'output_dim') and
+                    features.shape[-1] != cond_module.output_dim):
+                features = cond_module.proj_out(features)
+                conditioning[key] = [features, mask]
+
+        conditioning["video"] = self._encode_images_clip(metadata)
+        return conditioning
+
+    def training_step(self, batch, batch_idx):
+        actions, metadata = batch  # actions: (B, action_dim=14, chunk_size)
+        batch_size = actions.shape[0]
+
+        # --- Project actions to latent space ---
+        latent_actions = self.diffusion.encode_actions(actions)  # (B, 64, T)
+
+        # --- Reconstruction loss (train adapter round-trip) ---
+        recon_actions = self.diffusion.decode_latent(latent_actions)  # (B, 14, T)
+        loss_recon = F.mse_loss(recon_actions, actions)
+
+        # --- Conditioning ---
+        conditioning = self._build_conditioning(metadata)
+
+        if self.cfg_dropout_prob > 0 and self.training:
+            mask = torch.rand(batch_size, device=self.device) < self.cfg_dropout_prob
+            if mask.any():
+                null_meta = [{
+                    "prompt": "",
+                    "camera_images": [img * 0 for img in m["camera_images"]],
+                    "proprio": m["proprio"] * 0,
+                } for m in metadata]
+                null_cond = self._build_conditioning(
+                    [null_meta[i] if mask[i] else metadata[i] for i in range(batch_size)]
+                )
+                conditioning = null_cond
+
+        cond_inputs = self.diffusion.get_conditioning_inputs(conditioning)
+
+        # --- Diffusion in latent space ---
+        t = self._sample_timesteps(batch_size)
+        alphas, sigmas = _get_alphas_sigmas(t)
+        alphas = alphas[:, None, None]
+        sigmas = sigmas[:, None, None]
+
+        noise = torch.randn_like(latent_actions)
+        noised_latent = latent_actions * alphas + noise * sigmas
+
+        # v-prediction target in latent space
+        targets = noise * alphas - latent_actions * sigmas
+
+        # Forward through DiT backbone
+        output = self.diffusion.model(
+            noised_latent,
+            t,
+            **cond_inputs,
+        )
+
+        loss_diffusion = F.mse_loss(output, targets)
+
+        # --- Combined loss ---
+        loss = loss_diffusion + self.recon_weight * loss_recon
+
+        # Logging
+        self.log("train/loss", loss, prog_bar=True)
+        self.log("train/loss_diffusion", loss_diffusion, prog_bar=True)
+        self.log("train/loss_recon", loss_recon)
+        if self.log_loss_info:
+            with torch.no_grad():
+                self.log("train/mean_t", t.mean())
+
+        return loss
+
+    def on_before_zero_grad(self, *args, **kwargs):
+        if self.ema is not None:
+            self.ema.update(self.diffusion)
+
+    def configure_optimizers(self):
+        """Build optimizer with differential learning rates.
+
+        Parameter groups:
+          1. Adapter (input_proj, output_proj, trajectory conditioner): adapter_lr
+          2. DiT backbone: adapter_lr * dit_lr_scale
+          T5/CLIP are frozen (requires_grad=False) so excluded automatically.
+        """
+        diff_cfg = self.optimizer_configs.get("diffusion", {})
+        opt_cfg = diff_cfg.get("optimizer", {}).get("config", {})
+        sched_cfg = diff_cfg.get("scheduler", {})
+
+        adapter_lr = self.finetune_config.get("adapter_lr", opt_cfg.get("lr", 1e-4))
+        dit_lr_scale = self.finetune_config.get("dit_lr_scale", 0.1)
+        betas = tuple(opt_cfg.get("betas", [0.9, 0.999]))
+        weight_decay = opt_cfg.get("weight_decay", 0.01)
+
+        # Collect parameter ID sets for each group
+        adapter_ids = {id(p) for p in self.diffusion.adapter_parameters() if p.requires_grad}
+        backbone_ids = {id(p) for p in self.diffusion.backbone_parameters() if p.requires_grad}
+
+        adapter_params = [p for p in self.diffusion.adapter_parameters() if p.requires_grad]
+        backbone_params = [p for p in self.diffusion.backbone_parameters() if p.requires_grad]
+
+        param_groups = []
+        if adapter_params:
+            param_groups.append({
+                "params": adapter_params,
+                "lr": adapter_lr,
+                "name": "adapter",
+            })
+        if backbone_params:
+            param_groups.append({
+                "params": backbone_params,
+                "lr": adapter_lr * dit_lr_scale,
+                "name": "backbone",
+            })
+
+        if not param_groups:
+            raise ValueError("No trainable parameters found!")
+
+        optimizer = torch.optim.AdamW(
+            param_groups,
+            betas=betas,
+            weight_decay=weight_decay,
+        )
+
+        n_adapter = sum(p.numel() for p in adapter_params)
+        n_backbone = sum(p.numel() for p in backbone_params)
+        print(f"[FineTune Optimizer] adapter: {n_adapter/1e6:.1f}M params @ lr={adapter_lr}")
+        print(f"[FineTune Optimizer] backbone: {n_backbone/1e6:.1f}M params @ lr={adapter_lr * dit_lr_scale}")
+
+        result = {"optimizer": optimizer}
+
+        sched_type = sched_cfg.get("type", "")
+        sched_params = sched_cfg.get("config", {})
+        if sched_type == "CosineAnnealingLR":
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=sched_params.get("T_max", 50000),
+                eta_min=sched_params.get("eta_min", 1e-6),
+            )
+            result["lr_scheduler"] = {"scheduler": scheduler, "interval": "step"}
+
+        return result
+
+    def export_model(self, path, use_safetensors=False):
+        """Export full fine-tuned model (base_model + adapters, with EMA)."""
+        model_to_save = copy.deepcopy(self.diffusion)
+        if self.ema is not None:
+            self.ema.apply(model_to_save)
+
+        if use_safetensors:
+            from safetensors.torch import save_file
+            save_file(model_to_save.state_dict(), path)
+        else:
+            torch.save(model_to_save.state_dict(), path)
+        print(f"[FineTune] Exported model to {path}")
 
 
 class RobotDemoCallback(pl.callbacks.Callback):

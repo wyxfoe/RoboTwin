@@ -1,10 +1,19 @@
 # ============================================================
 # AudioX Policy Configuration for RoboTwin Evaluation
 # ============================================================
-# Workflow:
-#   1. Fine-tune with train_robotx.py → saves checkpoint + action_stats.pt
-#   2. Set model_config, ckpt_path, action_stats_path below
-#   3. Run eval.sh <task> <task_config> <seed> <gpu_id>
+# Two workflows:
+#
+# A) Direct mode (small DiT from scratch):
+#   1. Train with train_robotx.py → saves checkpoint + action_stats.pt
+#   2. Set model_config to configs/robotx_aloha_agilex.json
+#
+# B) Fine-tune mode (AudioX 1.2B pretrained):
+#   1. Fine-tune with train_finetune.py → saves checkpoint + action_stats.pt
+#   2. Set model_config to configs/robotx_finetune_1_2b.json
+#
+# Then:
+#   3. Set ckpt_path, action_stats_path below
+#   4. Run eval.sh <task> <task_config> <seed> <gpu_id>
 # ============================================================
 
 # --- Eval framework fields (keep null, overridden by eval.sh) ---
@@ -17,11 +26,15 @@ instruction_type: unseen
 head_camera_type: D435
 
 # --- AudioX model loading ---
-# Option 1: config + checkpoint (fine-tuned model)
-model_config: configs/robotx_aloha_agilex.json
+# Option 1: Direct mode (small DiT, io_channels=action_dim)
+# model_config: configs/robotx_aloha_agilex.json
+
+# Option 2: Fine-tune mode (AudioX 1.2B, io_channels=64 latent)
+model_config: configs/robotx_finetune_1_2b.json
+
 ckpt_path: null
 
-# Option 2: HuggingFace pretrained (base model, not recommended for eval)
+# Option 3: HuggingFace pretrained (base model, not recommended for eval)
 pretrained_name: null
 
 # --- Post-processing weights (produced by training) ---

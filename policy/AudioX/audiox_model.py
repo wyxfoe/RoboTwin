@@ -4,6 +4,11 @@ AudioX Model Wrapper for RoboTwin Evaluation.
 Wraps the fine-tuned AudioX (Diffusion Transformer) model for robot action generation.
 AudioX has been adapted from its original audio generation architecture to output
 robot joint actions conditioned on camera images, language instructions, and robot state.
+
+Supports two modes:
+  1. Direct mode (original): io_channels == action_dim, DiT operates in action space
+  2. Fine-tune mode (1.2B):  io_channels == 64, DiT operates in latent space,
+     adapter layers (input_proj / output_proj) bridge action ↔ latent spaces
 """
 
 import os
@@ -53,6 +58,7 @@ from stable_audio_tools.inference.sampling import sample
 
 # Use our robotics adapter that remaps config keys for AudioX factory
 from robotics.robot_model import create_robot_model_from_config
+from robotics.finetune_model import AudioXFineTuneModel, create_finetune_model
 
 
 # CLIP-ViT-B/32 normalization constants
@@ -150,13 +156,25 @@ class AudioXRobot:
         self.left_gripper_idx = left_arm_dim
         self.right_gripper_idx = left_arm_dim + 1 + right_arm_dim
 
-        # Load model
+        # Load model — detect fine-tune mode from config
         if pretrained_name is not None:
             self.model, self.model_config = get_pretrained_model(pretrained_name)
+            self.is_finetune = False
         else:
             with open(model_config_path, "r") as f:
                 self.model_config = json.load(f)
-            self.model = create_robot_model_from_config(self.model_config)
+
+            self.is_finetune = self.model_config.get("model_type") == "robot_finetune"
+
+            if self.is_finetune:
+                # Fine-tune mode: build AudioXFineTuneModel with adapter layers
+                self.model = create_finetune_model(self.model_config, audiox_ckpt_path=None)
+                self.latent_dim = self.model_config.get("latent_dim", 64)
+                print(f"[AudioX] Fine-tune mode: action_dim={action_dim} → latent_dim={self.latent_dim}")
+            else:
+                # Direct mode: io_channels == action_dim
+                self.model = create_robot_model_from_config(self.model_config)
+
             if ckpt_path is not None:
                 self._load_checkpoint(ckpt_path)
 
@@ -170,8 +188,6 @@ class AudioXRobot:
         self.instruction = None
 
         # Extract sample rate and sample size from config if available
-        # sample_size = chunk_size (NOT chunk_size * action_dim)
-        # AudioX generates (batch, io_channels, sample_size) where io_channels = action_dim
         self.sample_rate = self.model_config.get("sample_rate", 1)
         self.sample_size = self.model_config.get("sample_size", self.action_chunk_size)
 
@@ -182,6 +198,8 @@ class AudioXRobot:
             print(f"[AudioX] Loaded action stats from {action_stats_path}")
 
         # Initialize ActionHead (LayerNorm + MLP) for output projection
+        # In fine-tune mode the output_proj inside the model handles latent→action,
+        # so ActionHead provides an optional additional refinement layer.
         self.action_head = ActionHead(action_dim).to(self.device)
         if action_head_path is not None and os.path.exists(action_head_path):
             head_state = torch.load(action_head_path, map_location=self.device)
@@ -196,11 +214,17 @@ class AudioXRobot:
         self._clip_std = torch.tensor(CLIP_IMAGE_STD).view(3, 1, 1)
 
         print(f"[AudioX] Model loaded successfully on {self.device}")
+        print(f"[AudioX] Mode: {'fine-tune (latent)' if self.is_finetune else 'direct'}")
         print(f"[AudioX] Action dim: {self.action_dim}, Chunk size: {self.action_chunk_size}")
         print(f"[AudioX] Arm config: left={self.left_arm_dim}, right={self.right_arm_dim}")
 
     def _load_checkpoint(self, ckpt_path):
-        """Load model weights from checkpoint file."""
+        """Load model weights from checkpoint file.
+
+        Handles both direct-mode and fine-tune-mode checkpoints.
+        Fine-tune checkpoints may have keys prefixed with 'diffusion.' from
+        the Lightning training wrapper — these are stripped automatically.
+        """
         if ckpt_path.endswith(".safetensors"):
             from safetensors.torch import load_file
             state_dict = load_file(ckpt_path)
@@ -211,7 +235,16 @@ class AudioXRobot:
             elif "model" in state_dict:
                 state_dict = state_dict["model"]
 
-        self.model.load_state_dict(state_dict, strict=False)
+        # Strip Lightning wrapper prefix if present
+        # (RobotFineTuneTrainingWrapper stores model as self.diffusion)
+        cleaned = {}
+        for k, v in state_dict.items():
+            if k.startswith("diffusion."):
+                cleaned[k[len("diffusion."):]] = v
+            else:
+                cleaned[k] = v
+
+        self.model.load_state_dict(cleaned, strict=False)
         print(f"[AudioX] Checkpoint loaded from {ckpt_path}")
 
     def set_language(self, instruction):
@@ -330,25 +363,35 @@ class AudioXRobot:
         """
         Generate robot actions using AudioX diffusion inference.
 
-        Pipeline:
-          1. Build conditioning (RDT-style multi-view CLIP + T5 + proprio)
-          2. Run diffusion sampling → raw output (batch, action_dim, chunk_size)
-          3. Transpose to robot convention (chunk_size, action_dim)
-          4. Apply ActionHead (LayerNorm + MLP) for action-space projection
-          5. Denormalize from training normalization back to real joint angles
-          6. Clamp gripper values to valid range [0, 1]
+        Direct mode pipeline:
+          1. Build conditioning
+          2. Diffusion sampling in action space → (B, action_dim, T)
+          3. Transpose → (T, action_dim), apply ActionHead
+          4. Denormalize + clamp gripper
+
+        Fine-tune mode pipeline:
+          1. Build conditioning
+          2. Diffusion sampling in 64-dim latent space → (B, 64, T)
+          3. output_proj: (B, 64, T) → (B, 14, T)
+          4. Transpose → (T, 14), apply ActionHead
+          5. Denormalize + clamp gripper
 
         Returns:
             actions: numpy array of shape (action_chunk_size, action_dim)
         """
         assert self.observation_window is not None, "Must call update_observation_window first!"
 
-        # Step 1: Build conditioning (bypasses CLIPConditioner temporal transformer)
+        # Step 1: Build conditioning
         conditioning = self._build_conditioning()
         cond_inputs = self.model.get_conditioning_inputs(conditioning)
 
         # Step 2: Diffusion sampling
-        noise = torch.randn(1, self.action_dim, self.action_chunk_size).to(self.device)
+        if self.is_finetune:
+            # Sample in 64-dim latent space
+            noise = torch.randn(1, self.latent_dim, self.action_chunk_size).to(self.device)
+        else:
+            # Sample directly in action space
+            noise = torch.randn(1, self.action_dim, self.action_chunk_size).to(self.device)
 
         if self.model.diffusion_objective == "v":
             output = sample(
@@ -362,19 +405,23 @@ class AudioXRobot:
                 **cond_inputs, cfg_scale=3.0, batch_cfg=True,
             )
 
-        # Step 3: Transpose (action_dim, chunk_size) → (chunk_size, action_dim)
+        # Step 3: Decode latent → actions (fine-tune mode only)
+        if self.is_finetune:
+            output = self.model.decode_latent(output)  # (B, 64, T) → (B, 14, T)
+
+        # Step 4: Transpose (action_dim, chunk_size) → (chunk_size, action_dim)
         actions = output.squeeze(0).T  # (chunk_size, action_dim)
         actions = actions[:self.action_chunk_size]
 
-        # Step 4: Apply ActionHead
+        # Step 5: Apply ActionHead
         actions = actions.to(self.device)
         actions = self.action_head(actions)
 
-        # Step 5: Denormalize
+        # Step 6: Denormalize
         if self.action_stats is not None:
             actions = self._denormalize_actions(actions)
 
-        # Step 6: Clamp gripper values
+        # Step 7: Clamp gripper values
         actions = self._clamp_gripper(actions)
 
         return actions.cpu().numpy()

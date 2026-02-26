@@ -3,9 +3,10 @@
 Core modules (always available):
     robot_model     — config adapter + model factory
     action_space    — action normalization / denormalization
+    finetune_model  — AudioX 1.2B fine-tuning adapter layers + weight loading
 
 Training-only modules (require pytorch_lightning, h5py, cv2):
-    robot_training  — Lightning training wrapper
+    robot_training  — Lightning training wrapper (includes FineTuneTrainingWrapper)
     robotwin_dataset — HDF5 data loader
 """
 from .robot_model import create_robot_model_from_config
