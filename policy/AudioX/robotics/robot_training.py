@@ -20,7 +20,7 @@ import torch.nn.functional as F
 def _get_alphas_sigmas(t):
     """Cosine noise schedule: alpha(t)=cos(pi/2*t), sigma(t)=sin(pi/2*t).
 
-    Compatible with stable_audio_tools.inference.sampling.get_alphas_sigmas.
+    Compatible with audiox.inference.sampling.get_alphas_sigmas.
     """
     alphas = torch.cos(t * math.pi / 2)
     sigmas = torch.sin(t * math.pi / 2)
@@ -531,31 +531,56 @@ class RobotDemoCallback(pl.callbacks.Callback):
         actions, metadata = batch
         n = min(self.num_demos, actions.shape[0])
 
-        try:
-            from stable_audio_tools.inference.generation import generate_diffusion_cond
-        except ImportError:
-            return  # Skip if inference module unavailable
-
         model = pl_module.diffusion
         model_config = getattr(model, "_config", {})
         sample_size = model_config.get("sample_size", actions.shape[2])
-        sample_rate = model_config.get("sample_rate", 1)
+        latent_dim = model_config.get("latent_dim", 64)
+        action_dim = model_config.get("action_dim", 14)
+
+        # Build conditioning from metadata
+        conditioning = pl_module._build_conditioning(metadata[:n])
+        cond_inputs = model.get_conditioning_inputs(conditioning)
 
         for cfg_scale in self.demo_cfg_scales:
-            demo_cond = metadata[:n]
-            preds = generate_diffusion_cond(
-                model,
-                conditioning=demo_cond,
-                sample_size=sample_size,
-                sample_rate=sample_rate,
-                device=pl_module.device,
-                steps=self.demo_steps,
-                cfg_scale=cfg_scale,
-            )
+            # Sample in latent space (fine-tune mode)
+            noise = torch.randn(n, latent_dim, sample_size, device=pl_module.device)
+            
+            # Use v-prediction sampling
+            if model.diffusion_objective == "v":
+                try:
+                    # Newer audiox API requires explicit eta argument
+                    from audiox.inference.sampling import sample
+                    preds_latent = sample(
+                        model.model,
+                        noise,
+                        steps=self.demo_steps,
+                        eta=1.0,
+                        **cond_inputs,
+                        cfg_scale=cfg_scale,
+                        batch_cfg=True,
+                    )
+                except ImportError:
+                    return  # Skip demos if sampling API unavailable
+            else:
+                try:
+                    from audiox.inference.sampling import sample_discrete_euler
+                    preds_latent = sample_discrete_euler(
+                        model.model,
+                        noise,
+                        steps=self.demo_steps,
+                        **cond_inputs,
+                        cfg_scale=cfg_scale,
+                        batch_cfg=True,
+                    )
+                except ImportError:
+                    return  # Skip demos if sampling API unavailable
+            
+            # Decode from latent to action space
+            preds = model.decode_latent(preds_latent)  # (B, action_dim, T)
 
             # Compute MSE against ground truth
             gt = actions[:n].to(pl_module.device)
-            mse = F.mse_loss(preds[:n], gt).item()
+            mse = F.mse_loss(preds, gt).item()
             pl_module.log(f"demo/mse_cfg{cfg_scale}", mse)
 
         print(f"[Demo] Step {trainer.global_step}: generated {n} demos")

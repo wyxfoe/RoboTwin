@@ -32,20 +32,21 @@ head_camera_type: D435
 # Option 2: Fine-tune mode (AudioX 1.2B, io_channels=64 latent)
 model_config: configs/robotx_finetune_1_2b.json
 
-ckpt_path: null
+ckpt_path: checkpoints/beat_block_hammer_finetune/robotx-finetune-epochepoch=199.ckpt
 
 # Option 3: HuggingFace pretrained (base model, not recommended for eval)
 pretrained_name: null
 
 # --- Post-processing weights (produced by training) ---
-action_stats_path: null   # path to action_stats.pt for denormalization
+action_stats_path: checkpoints/beat_block_hammer_finetune/action_stats.pt   # path to action_stats.pt for denormalization
 action_head_path: null     # path to action_head.pt  (optional, identity if null)
 
 # --- Action space ---
 action_dim: 14             # ALOHA-Agilex: (6+1)*2 = 14
 action_chunk_size: 50      # diffusion generates 50-step trajectory
 
-# --- Vision ---
+# --- Vision (must match training camera_names in config) ---
+# Training uses: [front_camera, head_camera, left_camera, right_camera]
 img_size: 224              # CLIP-ViT-B/32 input resolution
 
 # --- Runtime ---

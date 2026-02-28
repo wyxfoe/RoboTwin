@@ -91,7 +91,20 @@ def main():
     parser.add_argument("--strategy", type=str, default="auto")
     parser.add_argument("--precision", type=str, default="bf16-mixed",
                         help="bf16-mixed recommended for 1.2B model")
-    parser.add_argument("--max_steps", type=int, default=50000)
+    parser.add_argument(
+        "--max_steps",
+        type=int,
+        default=50000,
+        help="Maximum number of training steps. "
+             "If --max_epochs is set, this will be ignored."
+    )
+    parser.add_argument(
+        "--max_epochs",
+        type=int,
+        default=None,
+        help="Maximum number of training epochs. "
+             "If set, overrides --max_steps."
+    )
     parser.add_argument("--accumulate_grad_batches", type=int, default=1)
     parser.add_argument("--gradient_clip_val", type=float, default=1.0)
     parser.add_argument("--num_workers", type=int, default=None)
@@ -101,7 +114,11 @@ def main():
     parser.add_argument("--ckpt_path", type=str, default=None,
                         help="Resume from fine-tuning checkpoint")
     parser.add_argument("--save_dir", type=str, default="./checkpoints/finetune")
-    parser.add_argument("--save_every", type=int, default=2000)
+    parser.add_argument("--save_every", type=int, default=2000,
+                        help="Save checkpoint every N steps (if using --max_steps)")
+    parser.add_argument("--save_every_epoch", type=int, default=None,
+                        help="Save checkpoint every N epochs (if using --max_epochs). "
+                             "If set, overrides --save_every behavior.")
 
     # Logging
     parser.add_argument("--project_name", type=str, default="robotx-finetune")
@@ -208,14 +225,29 @@ def main():
         torch.save(train_dataset.action_stats, stats_path)
         print(f"  Saved action statistics to {stats_path}")
 
-    # Callbacks
-    callbacks = [
-        ModelCheckpoint(
+    # Callbacks - determine save strategy based on training mode
+    if args.max_epochs is not None:
+        # Epoch-based training: save by epoch
+        save_every_epoch = args.save_every_epoch if args.save_every_epoch is not None else 1
+        checkpoint_callback = ModelCheckpoint(
+            dirpath=args.save_dir,
+            filename="robotx-finetune-epoch{epoch:03d}",
+            every_n_epochs=save_every_epoch,
+            save_top_k=-1,
+        )
+        print(f"  Checkpoint saving: every {save_every_epoch} epoch(s)")
+    else:
+        # Step-based training: save by step
+        checkpoint_callback = ModelCheckpoint(
             dirpath=args.save_dir,
             filename="robotx-finetune-{step:08d}",
             every_n_train_steps=args.save_every,
             save_top_k=-1,
-        ),
+        )
+        print(f"  Checkpoint saving: every {args.save_every} steps")
+    
+    callbacks = [
+        checkpoint_callback,
         LearningRateMonitor(logging_interval="step"),
     ]
 
@@ -247,7 +279,7 @@ def main():
     else:
         strategy = "auto"
 
-    trainer = pl.Trainer(
+    trainer_kwargs = dict(
         devices=args.num_gpus if args.num_gpus > 0 else "auto",
         num_nodes=args.num_nodes,
         accelerator="gpu" if torch.cuda.is_available() and args.num_gpus > 0 else "cpu",
@@ -257,13 +289,22 @@ def main():
         gradient_clip_val=args.gradient_clip_val,
         callbacks=callbacks,
         logger=logger,
-        max_steps=args.max_steps,
         log_every_n_steps=10,
         val_check_interval=None,
         limit_val_batches=0,
         enable_checkpointing=True,
         sync_batchnorm=args.num_gpus > 1,
     )
+
+    # Prefer epoch-based stopping if max_epochs is provided
+    if args.max_epochs is not None:
+        trainer_kwargs["max_epochs"] = args.max_epochs
+        # Disable step-based early stopping when using epochs
+        trainer_kwargs["max_steps"] = -1
+    else:
+        trainer_kwargs["max_steps"] = args.max_steps
+
+    trainer = pl.Trainer(**trainer_kwargs)
 
     # Train
     print("\n" + "=" * 60)

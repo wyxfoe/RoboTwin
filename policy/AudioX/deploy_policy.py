@@ -35,10 +35,14 @@ def encode_obs(observation):
     Extracts camera RGB images and robot joint state from the
     RoboTwin observation dictionary.
 
+    Camera order MUST match training: [front_camera, head_camera, left_camera, right_camera].
+    If front_camera is not available (e.g. some env configs), use head_camera as fallback.
+
     Args:
         observation: RoboTwin observation dict with structure:
             {
                 "observation": {
+                    "front_camera": {"rgb": np.ndarray},  # optional
                     "head_camera": {"rgb": np.ndarray},
                     "left_camera": {"rgb": np.ndarray},
                     "right_camera": {"rgb": np.ndarray},
@@ -53,13 +57,18 @@ def encode_obs(observation):
             }
 
     Returns:
-        input_rgb_arr: List of 3 camera images [head, right, left].
+        input_rgb_arr: List of 4 camera images [front, head, left, right].
         input_state: Joint state vector.
     """
+    obs = observation["observation"]
+    front_cam = obs.get("front_camera", {}).get("rgb")
+    if front_cam is None:
+        front_cam = obs["head_camera"]["rgb"]  # fallback
     input_rgb_arr = [
-        observation["observation"]["head_camera"]["rgb"],
-        observation["observation"]["right_camera"]["rgb"],
-        observation["observation"]["left_camera"]["rgb"],
+        front_cam,
+        obs["head_camera"]["rgb"],
+        obs["left_camera"]["rgb"],
+        obs["right_camera"]["rgb"],
     ]
     input_state = observation["joint_action"]["vector"]
 

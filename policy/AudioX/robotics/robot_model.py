@@ -1,6 +1,6 @@
 """Robot model factory — uses AudioX's create_model_from_config directly.
 
-AudioX is a 'diffusion_cond' model in stable_audio_tools.  Our JSON configs
+AudioX is a 'diffusion_cond' model in audiox.  Our JSON configs
 use model_type='robot_diffusion' as a marker; this function remaps it to the
 AudioX-native 'diffusion_cond' type before calling the factory.
 """
@@ -14,19 +14,22 @@ _policy_dir = os.path.dirname(os.path.abspath(__file__))
 _audiox_search_paths = [
     os.environ.get("AUDIOX_PATH", ""),
     os.path.join(_policy_dir, "../../../../AudioX-"),
+    os.path.join(_policy_dir, "../../../../AudioX"),
     os.path.join(_policy_dir, "../../../AudioX-"),
+    os.path.join(_policy_dir, "../../../AudioX"),
     os.path.join(_policy_dir, "../../AudioX-"),
+    os.path.join(_policy_dir, "../../AudioX"),
 ]
 for _p in _audiox_search_paths:
     if not _p:
         continue
     _p = os.path.abspath(_p)
-    if os.path.isdir(os.path.join(_p, "stable_audio_tools")):
+    if os.path.isdir(os.path.join(_p, "audiox")):
         if _p not in sys.path:
             sys.path.insert(0, _p)
         break
 
-from stable_audio_tools.models.factory import create_model_from_config
+from audiox.models.factory import create_model_from_config
 
 
 def create_robot_model_from_config(config):

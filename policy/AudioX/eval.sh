@@ -34,7 +34,21 @@ gpu_id=${4}
 export CUDA_VISIBLE_DEVICES=${gpu_id}
 echo -e "\033[33mgpu id (to use): ${gpu_id}\033[0m"
 
-cd ../..  # move to RoboTwin root
+# cd to RoboTwin root (works regardless of cwd when script is invoked)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+cd "$ROOT_DIR"
+
+# Auto-set AUDIOX_PATH if not set and AudioX exists in common locations
+if [ -z "$AUDIOX_PATH" ]; then
+  for cand in "$ROOT_DIR/AudioX" "$ROOT_DIR/AudioX-" "$(dirname "$ROOT_DIR")/AudioX" "$(dirname "$ROOT_DIR")/AudioX-"; do
+    if [ -d "$cand/audiox" ]; then
+      export AUDIOX_PATH="$cand"
+      echo -e "\033[33mAUDIOX_PATH=$AUDIOX_PATH\033[0m"
+      break
+    fi
+  done
+fi
 
 PYTHONWARNINGS=ignore::UserWarning \
 python script/eval_policy.py --config policy/$policy_name/deploy_policy.yml \

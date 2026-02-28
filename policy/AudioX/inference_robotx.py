@@ -36,11 +36,11 @@ _script_dir = os.path.dirname(os.path.abspath(__file__))
 if _script_dir not in sys.path:
     sys.path.insert(0, _script_dir)
 
-# Import robotics module first — it sets up AUDIOX_PATH for stable_audio_tools
+# Import robotics module first — it sets up AUDIOX_PATH for audiox
 from robotics.robot_model import create_robot_model_from_config
 from robotics.action_space import denormalize_actions
 
-from stable_audio_tools.inference.sampling import (
+from audiox.inference.sampling import (
     get_alphas_sigmas,
     sample,
     sample_discrete_euler,

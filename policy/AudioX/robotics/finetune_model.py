@@ -20,6 +20,7 @@ import copy
 import os
 import sys
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -28,19 +29,156 @@ _policy_dir = os.path.dirname(os.path.abspath(__file__))
 _audiox_search_paths = [
     os.environ.get("AUDIOX_PATH", ""),
     os.path.join(_policy_dir, "../../../../AudioX-"),
+    os.path.join(_policy_dir, "../../../../AudioX"),
     os.path.join(_policy_dir, "../../../AudioX-"),
+    os.path.join(_policy_dir, "../../../AudioX"),
     os.path.join(_policy_dir, "../../AudioX-"),
+    os.path.join(_policy_dir, "../../AudioX"),
 ]
 for _p in _audiox_search_paths:
     if not _p:
         continue
     _p = os.path.abspath(_p)
-    if os.path.isdir(os.path.join(_p, "stable_audio_tools")):
+    if os.path.isdir(os.path.join(_p, "audiox")):
         if _p not in sys.path:
             sys.path.insert(0, _p)
         break
 
-from stable_audio_tools.models.factory import create_model_from_config
+from audiox.models.factory import create_model_from_config
+
+# Import conditioners module to register TrajectoryConditioner
+from audiox.models import conditioners
+import typing as tp
+
+
+# ---------------------------------------------------------------------------
+# Trajectory Conditioner (for robot proprioceptive state)
+# ---------------------------------------------------------------------------
+
+class TrajectoryConditioner(conditioners.Conditioner):
+    """Conditioner for robot trajectory/proprioceptive state.
+    
+    Maps a state vector (e.g., 14-dim joint angles) to conditioning tokens
+    via an MLP projection.
+    """
+    
+    def __init__(
+        self,
+        output_dim: int,
+        state_dim: int = 14,
+        mode: str = "mlp",
+        project_out: bool = True,
+    ):
+        """
+        Args:
+            output_dim: Output token dimension (matches cond_dim, e.g., 768)
+            state_dim: Input state dimension (e.g., 14 for dual-arm robot)
+            mode: Projection mode ("mlp" or "linear")
+            project_out: Whether to project to output_dim
+        """
+        # Initialize parent with dim=output_dim to avoid double projection
+        # (we handle projection ourselves via mlp)
+        super().__init__(
+            dim=output_dim,
+            output_dim=output_dim,
+            project_out=False  # We do our own projection
+        )
+        
+        self.state_dim = state_dim
+        self.mode = mode
+        
+        if mode == "mlp":
+            # MLP: state_dim -> hidden -> output_dim
+            hidden_dim = max(state_dim * 2, output_dim // 2)
+            self.mlp = nn.Sequential(
+                nn.Linear(state_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, output_dim),
+            )
+        else:  # linear
+            self.mlp = nn.Linear(state_dim, output_dim)
+    
+    def forward(self, states: tp.List[tp.Union[torch.Tensor, np.ndarray]], device=None) -> tp.Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            states: List of state vectors, each of shape (state_dim,)
+            device: Device to place tensors on
+        
+        Returns:
+            [features, mask] where:
+                features: (batch_size, 1, output_dim) - single token per state
+                mask: (batch_size, 1) - all ones (no masking)
+        """
+        if device is None:
+            device = next(self.parameters()).device
+        
+        # Convert to tensor and stack
+        if isinstance(states[0], np.ndarray):
+            states_tensor = torch.stack([torch.from_numpy(s).float() for s in states])
+        else:
+            states_tensor = torch.stack([s.float() if isinstance(s, torch.Tensor) else torch.tensor(s).float() 
+                                       for s in states])
+        
+        states_tensor = states_tensor.to(device)
+        
+        # Project through MLP
+        features = self.mlp(states_tensor)  # (batch_size, output_dim)
+        features = features.unsqueeze(1)     # (batch_size, 1, output_dim)
+        
+        # Create mask (all ones, no masking)
+        mask = torch.ones(features.shape[0], 1, device=device)
+        
+        return [features, mask]
+
+
+# Register TrajectoryConditioner in conditioners module
+def _register_trajectory_conditioner():
+    """Register trajectory conditioner type in AudioX's conditioners module."""
+    # Save original function
+    original_create = conditioners.create_multi_conditioner_from_conditioning_config
+    
+    def create_with_trajectory(config: tp.Dict[str, tp.Any]) -> conditioners.MultiConditioner:
+        """Wrapper that adds trajectory conditioner support."""
+        conditioners_dict = {}
+        cond_dim = config["cond_dim"]
+        default_keys = config.get("default_keys", {})
+        
+        # Separate trajectory and non-trajectory conditioners
+        trajectory_configs = []
+        other_configs = []
+        
+        for conditioner_info in config["configs"]:
+            if conditioner_info["type"] == "trajectory":
+                trajectory_configs.append(conditioner_info)
+            else:
+                other_configs.append(conditioner_info)
+        
+        # Create trajectory conditioners
+        for conditioner_info in trajectory_configs:
+            id = conditioner_info["id"]
+            conditioner_config = {"output_dim": cond_dim}
+            conditioner_config.update(conditioner_info["config"])
+            conditioners_dict[id] = TrajectoryConditioner(**conditioner_config)
+        
+        # Create other conditioners using original function
+        if other_configs:
+            other_config = {
+                "cond_dim": cond_dim,
+                "default_keys": default_keys,
+                "configs": other_configs
+            }
+            other_multi = original_create(other_config)
+            conditioners_dict.update(other_multi.conditioners)
+        
+        return conditioners.MultiConditioner(conditioners_dict, default_keys=default_keys)
+    
+    # Replace the function
+    conditioners.create_multi_conditioner_from_conditioning_config = create_with_trajectory
+
+
+# Register on import
+_register_trajectory_conditioner()
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +286,11 @@ class AudioXFineTuneModel(nn.Module):
     @property
     def sample_size(self):
         return getattr(self.base_model, "sample_size", 50)
+
+    @property
+    def pretransform(self):
+        """Pretransform is replaced by input_proj in fine-tune mode."""
+        return None
 
     def get_conditioning_inputs(self, conditioning):
         return self.base_model.get_conditioning_inputs(conditioning)

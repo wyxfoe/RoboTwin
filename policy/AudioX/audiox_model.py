@@ -20,7 +20,7 @@ import torch.nn as nn
 import cv2
 from PIL import Image
 
-# Add AudioX source directory to Python path to find stable_audio_tools.
+# Add AudioX source directory to Python path to find audiox.
 # Resolution order:
 #   1. AUDIOX_PATH environment variable (explicit override)
 #   2. ../../../AudioX-  (sibling to RoboTwin project root)
@@ -35,26 +35,28 @@ if policy_dir not in sys.path:
 _audiox_search_paths = [
     os.environ.get("AUDIOX_PATH", ""),
     os.path.join(policy_dir, "../../../AudioX-"),
+    os.path.join(policy_dir, "../../../AudioX"),
     os.path.join(policy_dir, "../../AudioX-"),
+    os.path.join(policy_dir, "../../AudioX"),
 ]
 
 for _p in _audiox_search_paths:
     if not _p:
         continue
     _p = os.path.abspath(_p)
-    if os.path.isdir(os.path.join(_p, "stable_audio_tools")):
+    if os.path.isdir(os.path.join(_p, "audiox")):
         if _p not in sys.path:
             sys.path.insert(0, _p)
         break
 else:
     raise ImportError(
-        "Cannot find AudioX source (stable_audio_tools).\n"
-        "Set the AUDIOX_PATH environment variable or place AudioX- beside the RoboTwin directory.\n"
+        "Cannot find AudioX source (audiox).\n"
+        "Set the AUDIOX_PATH environment variable or place AudioX beside the RoboTwin directory.\n"
         f"Searched: {[os.path.abspath(p) for p in _audiox_search_paths if p]}"
     )
 
-from stable_audio_tools.models.pretrained import get_pretrained_model
-from stable_audio_tools.inference.sampling import sample
+from audiox.models.pretrained import get_pretrained_model
+from audiox.inference.sampling import sample
 
 # Use our robotics adapter that remaps config keys for AudioX factory
 from robotics.robot_model import create_robot_model_from_config
@@ -256,19 +258,12 @@ class AudioXRobot:
         Update the observation window with current camera images and robot state.
 
         Args:
-            img_arr: List of 3 camera images [head, right, left] as numpy arrays (H, W, 3).
+            img_arr: List of 4 camera images [front, head, left, right] as numpy arrays (H, W, 3).
+                     Order MUST match training camera_names: [front_camera, head_camera, left_camera, right_camera].
             state: Robot joint state vector.
         """
-        img_head = self._preprocess_image(img_arr[0])
-        img_right = self._preprocess_image(img_arr[1])
-        img_left = self._preprocess_image(img_arr[2])
-
         self.observation_window = {
-            "images": {
-                "head": img_head,
-                "right_wrist": img_right,
-                "left_wrist": img_left,
-            },
+            "camera_images": [self._preprocess_image(img) for img in img_arr],
             "state": np.array(state, dtype=np.float32),
             "instruction": self.instruction,
         }
@@ -288,12 +283,12 @@ class AudioXRobot:
         return img_tensor
 
     @torch.no_grad()
-    def _encode_images_clip(self, images_dict):
+    def _encode_images_clip(self, camera_images):
         """Encode camera images through CLIP independently, concatenate features.
 
         RDT-style: each camera view is processed through CLIP individually,
         then all patch token sequences are concatenated along dim=1.
-        No temporal transformer — preserves full per-view spatial information.
+        Order MUST match training: [front_camera, head_camera, left_camera, right_camera].
 
         Returns:
             [concat_features, mask] matching AudioX conditioner output format.
@@ -302,8 +297,7 @@ class AudioXRobot:
         clip_model = clip_cond.visual_encoder_model
 
         all_features = []
-        for key in ["head", "left_wrist", "right_wrist"]:
-            img = images_dict[key]
+        for img in camera_images:
             img_tensor = self._preprocess_camera_image(img)
             # (1, C, H, W) for single image batch
             img_batch = img_tensor.unsqueeze(0).to(self.device)
@@ -354,7 +348,7 @@ class AudioXRobot:
                 conditioning[key] = [features, mask]
 
         # RDT-style: independent CLIP per camera, concatenate tokens
-        conditioning["video"] = self._encode_images_clip(self.observation_window["images"])
+        conditioning["video"] = self._encode_images_clip(self.observation_window["camera_images"])
 
         return conditioning
 
@@ -395,11 +389,11 @@ class AudioXRobot:
 
         if self.model.diffusion_objective == "v":
             output = sample(
-                self.model.model, noise, steps=50, starting_t=0,
+                self.model.model, noise, steps=50, eta=1.0,
                 **cond_inputs, cfg_scale=3.0, batch_cfg=True,
             )
         else:
-            from stable_audio_tools.inference.sampling import sample_discrete_euler
+            from audiox.inference.sampling import sample_discrete_euler
             output = sample_discrete_euler(
                 self.model.model, noise, steps=50,
                 **cond_inputs, cfg_scale=3.0, batch_cfg=True,
