@@ -4,8 +4,13 @@ RobotX Inference Script.
 Generates robot action trajectories conditioned on visual observations,
 language instructions, and proprioceptive state.
 
+Supports two model modes:
+  - Direct mode:    io_channels == action_dim, DiT operates in action space
+  - Fine-tune mode: io_channels == 64, DiT operates in latent space,
+    adapter layers (input_proj / output_proj) bridge action <-> latent spaces
+
 Usage:
-    # Single prediction
+    # Single prediction (direct mode)
     python inference_robotx.py \
         --config configs/robotx_robotwin.json \
         --ckpt_path checkpoints/robotx/robotx_final.safetensors \
@@ -14,10 +19,18 @@ Usage:
         --instruction "pick up the red cube" \
         --joint_state "0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.0"
 
+    # Single prediction (fine-tune mode)
+    python inference_robotx.py \
+        --config configs/robotx_finetune_1_2b.json \
+        --ckpt_path checkpoints/finetune/robotx_finetune_final.pt \
+        --action_stats checkpoints/finetune/action_stats.pt \
+        --image_path head.png,left.png,right.png \
+        --instruction "pick up the red cube"
+
     # Evaluation on RoboTwin episodes
     python inference_robotx.py \
-        --config configs/robotx_robotwin.json \
-        --ckpt_path checkpoints/robotx/robotx_final.safetensors \
+        --config configs/robotx_finetune_1_2b.json \
+        --ckpt_path checkpoints/finetune/robotx_finetune_final.pt \
         --eval_dir /path/to/robotwin/test_episodes \
         --output_dir results/
 """
@@ -38,6 +51,7 @@ if _script_dir not in sys.path:
 
 # Robotics adapters
 from robotics.robot_model import create_robot_model_from_config
+from robotics.finetune_model import create_finetune_model, AudioXFineTuneModel
 from robotics.action_space import denormalize_actions
 
 # Official AudioX package
