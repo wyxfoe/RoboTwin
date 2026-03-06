@@ -91,7 +91,9 @@ def main():
     parser.add_argument("--strategy", type=str, default="auto")
     parser.add_argument("--precision", type=str, default="bf16-mixed",
                         help="bf16-mixed recommended for 1.2B model")
-    parser.add_argument("--max_steps", type=int, default=50000)
+    parser.add_argument("--max_steps", type=int, default=None)
+    parser.add_argument("--max_epochs", type=int, default=None,
+                        help="Max training epochs (alternative to --max_steps)")
     parser.add_argument("--accumulate_grad_batches", type=int, default=1)
     parser.add_argument("--gradient_clip_val", type=float, default=1.0)
     parser.add_argument("--num_workers", type=int, default=None)
@@ -102,6 +104,8 @@ def main():
                         help="Resume from fine-tuning checkpoint")
     parser.add_argument("--save_dir", type=str, default="./checkpoints/finetune")
     parser.add_argument("--save_every", type=int, default=2000)
+    parser.add_argument("--save_every_epoch", type=int, default=None,
+                        help="Save checkpoint every N epochs (alternative to --save_every steps)")
 
     # Logging
     parser.add_argument("--project_name", type=str, default="robotx-finetune")
@@ -209,13 +213,19 @@ def main():
         print(f"  Saved action statistics to {stats_path}")
 
     # Callbacks
+    ckpt_kwargs = {
+        "dirpath": args.save_dir,
+        "save_top_k": -1,
+    }
+    if args.save_every_epoch is not None:
+        ckpt_kwargs["filename"] = "robotx-finetune-{epoch:04d}"
+        ckpt_kwargs["every_n_epochs"] = args.save_every_epoch
+    else:
+        ckpt_kwargs["filename"] = "robotx-finetune-{step:08d}"
+        ckpt_kwargs["every_n_train_steps"] = args.save_every
+
     callbacks = [
-        ModelCheckpoint(
-            dirpath=args.save_dir,
-            filename="robotx-finetune-{step:08d}",
-            every_n_train_steps=args.save_every,
-            save_top_k=-1,
-        ),
+        ModelCheckpoint(**ckpt_kwargs),
         LearningRateMonitor(logging_interval="step"),
     ]
 
@@ -247,23 +257,31 @@ def main():
     else:
         strategy = "auto"
 
-    trainer = pl.Trainer(
-        devices=args.num_gpus if args.num_gpus > 0 else "auto",
-        num_nodes=args.num_nodes,
-        accelerator="gpu" if torch.cuda.is_available() and args.num_gpus > 0 else "cpu",
-        strategy=strategy,
-        precision=args.precision,
-        accumulate_grad_batches=args.accumulate_grad_batches,
-        gradient_clip_val=args.gradient_clip_val,
-        callbacks=callbacks,
-        logger=logger,
-        max_steps=args.max_steps,
-        log_every_n_steps=10,
-        val_check_interval=None,
-        limit_val_batches=0,
-        enable_checkpointing=True,
-        sync_batchnorm=args.num_gpus > 1,
-    )
+    trainer_kwargs = {
+        "devices": args.num_gpus if args.num_gpus > 0 else "auto",
+        "num_nodes": args.num_nodes,
+        "accelerator": "gpu" if torch.cuda.is_available() and args.num_gpus > 0 else "cpu",
+        "strategy": strategy,
+        "precision": args.precision,
+        "accumulate_grad_batches": args.accumulate_grad_batches,
+        "gradient_clip_val": args.gradient_clip_val,
+        "callbacks": callbacks,
+        "logger": logger,
+        "log_every_n_steps": 10,
+        "val_check_interval": None,
+        "limit_val_batches": 0,
+        "enable_checkpointing": True,
+        "sync_batchnorm": args.num_gpus > 1,
+    }
+
+    if args.max_epochs is not None:
+        trainer_kwargs["max_epochs"] = args.max_epochs
+    elif args.max_steps is not None:
+        trainer_kwargs["max_steps"] = args.max_steps
+    else:
+        trainer_kwargs["max_steps"] = 50000
+
+    trainer = pl.Trainer(**trainer_kwargs)
 
     # Train
     print("\n" + "=" * 60)
