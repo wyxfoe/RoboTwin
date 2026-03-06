@@ -230,18 +230,20 @@ class AudioXRobot:
         Update the observation window with current camera images and robot state.
 
         Args:
-            img_arr: List of 3 camera images [head, right, left] as numpy arrays (H, W, 3).
+            img_arr: List of 4 camera images [front, head, left, right] as numpy arrays (H, W, 3).
             state: Robot joint state vector.
         """
-        img_head = self._preprocess_image(img_arr[0])
-        img_right = self._preprocess_image(img_arr[1])
+        img_front = self._preprocess_image(img_arr[0])
+        img_head = self._preprocess_image(img_arr[1])
         img_left = self._preprocess_image(img_arr[2])
+        img_right = self._preprocess_image(img_arr[3])
 
         self.observation_window = {
             "images": {
+                "front": img_front,
                 "head": img_head,
-                "right_wrist": img_right,
-                "left_wrist": img_left,
+                "left": img_left,
+                "right": img_right,
             },
             "state": np.array(state, dtype=np.float32),
             "instruction": self.instruction,
@@ -276,7 +278,7 @@ class AudioXRobot:
         clip_model = clip_cond.visual_encoder_model
 
         all_features = []
-        for key in ["head", "left_wrist", "right_wrist"]:
+        for key in ["front", "head", "left", "right"]:
             img = images_dict[key]
             img_tensor = self._preprocess_camera_image(img)
             # (1, C, H, W) for single image batch

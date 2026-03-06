@@ -53,13 +53,14 @@ def encode_obs(observation):
             }
 
     Returns:
-        input_rgb_arr: List of 3 camera images [head, right, left].
+        input_rgb_arr: List of 4 camera images [front, head, left, right].
         input_state: Joint state vector.
     """
     input_rgb_arr = [
+        observation["observation"]["front_camera"]["rgb"],
         observation["observation"]["head_camera"]["rgb"],
-        observation["observation"]["right_camera"]["rgb"],
         observation["observation"]["left_camera"]["rgb"],
+        observation["observation"]["right_camera"]["rgb"],
     ]
     input_state = observation["joint_action"]["vector"]
 
