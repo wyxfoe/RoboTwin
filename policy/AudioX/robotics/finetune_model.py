@@ -124,6 +124,15 @@ class AudioXFineTuneModel(nn.Module):
         return self.base_model.diffusion_objective
 
     @property
+    def pretransform(self):
+        """Robot model has no VAE pretransform (replaced by ActionInputProjection)."""
+        return None
+
+    @property
+    def io_channels(self):
+        return self.base_model.io_channels
+
+    @property
     def sample_rate(self):
         return getattr(self.base_model, "sample_rate", 1)
 
