@@ -704,17 +704,23 @@ class RobotDemoCallback(pl.callbacks.Callback):
         sample_size = model_config.get("sample_size", actions.shape[2])
         sample_rate = model_config.get("sample_rate", 1)
 
+        # Pre-compute conditioning tensors (maps camera_images → video, etc.)
+        demo_meta = metadata[:n]
+        conditioning_tensors = pl_module._build_conditioning(demo_meta)
+
         for cfg_scale in self.demo_cfg_scales:
-            demo_cond = metadata[:n]
             preds = generate_diffusion_cond(
                 model,
-                conditioning=demo_cond,
+                conditioning_tensors=conditioning_tensors,
                 sample_size=sample_size,
                 sample_rate=sample_rate,
                 device=pl_module.device,
                 steps=self.demo_steps,
                 cfg_scale=cfg_scale,
             )
+
+            # Decode from 64-dim latent space to 14-dim action space
+            preds = model.decode_latent(preds)
 
             # Compute MSE against ground truth
             gt = actions[:n].to(pl_module.device)
