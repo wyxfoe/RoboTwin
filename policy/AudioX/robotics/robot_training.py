@@ -277,6 +277,7 @@ class RobotFineTuneTrainingWrapper(pl.LightningModule):
           * adapter_lr   for input_proj, output_proj, trajectory conditioner
           * adapter_lr * dit_lr_scale   for DiT backbone
           * T5, CLIP conditioners are frozen
+      - Pre-caches frozen CLIP/T5 features to avoid redundant computation
 
     Loss function:
         L = L_diffusion + λ * L_reconstruction
@@ -314,6 +315,11 @@ class RobotFineTuneTrainingWrapper(pl.LightningModule):
         if use_ema:
             self.ema = EMA(model, decay=0.999)
 
+        # Conditioning feature cache (populated in on_fit_start)
+        # Maps sample_key -> {"video": [features, mask], "prompt": [features, mask]}
+        self._cond_cache = {}
+        self._cond_cache_enabled = False
+
     def _sample_timesteps(self, batch_size):
         if self.timestep_sampler == "logit_normal":
             u = torch.randn(batch_size, device=self.device)
@@ -321,6 +327,95 @@ class RobotFineTuneTrainingWrapper(pl.LightningModule):
         else:
             t = torch.rand(batch_size, device=self.device)
         return t
+
+    def on_fit_start(self):
+        """Pre-compute and cache frozen CLIP/T5 features for all training samples."""
+        trainer = self.trainer
+        dataloader = trainer.train_dataloader
+        if dataloader is None:
+            return
+
+        dataset = dataloader.dataset
+        num_samples = len(dataset)
+        print(f"\n[FineTune] Pre-computing CLIP + T5 features for {num_samples} samples...")
+
+        clip_cond = self.diffusion.conditioner.conditioners["video"]
+        clip_model = clip_cond.visual_encoder_model
+
+        # Pre-compute T5 embedding for the task description (single string, shared)
+        prompt_cond = self.diffusion.conditioner.conditioners.get("prompt")
+        cached_prompt = None
+        if prompt_cond is not None:
+            task_desc = dataset.task_description
+            cached_prompt = prompt_cond([task_desc], self.device)
+            # Also cache null prompt for CFG dropout
+            self._null_prompt = prompt_cond([""], self.device)
+        self._cached_prompt = cached_prompt
+
+        # Pre-compute CLIP features per unique (episode, timestep)
+        # Key: (ep_idx, start_t) -> concatenated CLIP features (1, num_cams*tokens, dim)
+        clip_cache = {}
+        num_cams = len(dataset.camera_names)
+
+        batch_size = 64  # process images in batches for efficiency
+        sample_keys = []
+        image_batches = {cam_idx: [] for cam_idx in range(num_cams)}
+
+        for sample_idx in range(num_samples):
+            ep_idx, start_t = dataset.samples[sample_idx]
+            key = (ep_idx, start_t)
+            if key in clip_cache:
+                continue
+            sample_keys.append(key)
+            # Get images from dataset cache or load
+            for cam_idx in range(num_cams):
+                if dataset.cache_in_memory:
+                    cam_data = dataset._ep_images[ep_idx].get(cam_idx, {})
+                    if start_t in cam_data:
+                        image_batches[cam_idx].append(torch.from_numpy(cam_data[start_t]))
+                    else:
+                        image_batches[cam_idx].append(
+                            torch.zeros(3, dataset.image_size, dataset.image_size))
+                else:
+                    # Fallback: load from disk
+                    _, metadata = dataset[sample_idx]
+                    for ci in range(num_cams):
+                        image_batches[ci].append(metadata["camera_images"][ci])
+                    break
+
+            # Process in batches
+            if len(sample_keys) == batch_size or sample_idx == num_samples - 1:
+                if not sample_keys:
+                    continue
+                n = len(sample_keys)
+                all_cam_features = []
+                with torch.no_grad():
+                    for cam_idx in range(num_cams):
+                        imgs = torch.stack(image_batches[cam_idx][:n]).to(self.device)
+                        outputs = clip_model(pixel_values=imgs)
+                        all_cam_features.append(outputs.last_hidden_state.cpu())
+
+                # concat cameras: (n, num_cams * tokens, dim)
+                concat = torch.cat(all_cam_features, dim=1)
+                for i, key in enumerate(sample_keys):
+                    clip_cache[key] = concat[i:i+1]  # (1, num_cams*tokens, dim)
+
+                sample_keys = []
+                image_batches = {cam_idx: [] for cam_idx in range(num_cams)}
+
+        # Also cache null (zero) image features for CFG dropout
+        with torch.no_grad():
+            null_features = []
+            zero_img = torch.zeros(1, 3, dataset.image_size, dataset.image_size).to(self.device)
+            for _ in range(num_cams):
+                outputs = clip_model(pixel_values=zero_img)
+                null_features.append(outputs.last_hidden_state.cpu())
+            self._null_clip = torch.cat(null_features, dim=1)  # (1, num_cams*tokens, dim)
+
+        self._clip_cache = clip_cache
+        self._cond_cache_enabled = True
+        print(f"[FineTune] Cached {len(clip_cache)} unique CLIP features. "
+              f"Training will skip CLIP/T5 encoding.")
 
     @torch.no_grad()
     def _encode_images_clip(self, metadata):
@@ -343,14 +438,71 @@ class RobotFineTuneTrainingWrapper(pl.LightningModule):
         mask = torch.ones(batch_size, concat_features.shape[1]).to(self.device)
         return [concat_features, mask]
 
+    def _get_cached_clip(self, metadata):
+        """Look up pre-computed CLIP features from cache."""
+        batch_features = []
+        for m in metadata:
+            key = m.get("_sample_key")
+            if key is not None and key in self._clip_cache:
+                batch_features.append(self._clip_cache[key])
+            elif key is None:
+                # Null sample from CFG dropout
+                batch_features.append(self._null_clip)
+            else:
+                # Unknown key, fallback to on-the-fly computation
+                return None
+        concat = torch.cat(batch_features, dim=0).to(self.device)
+        mask = torch.ones(concat.shape[0], concat.shape[1]).to(self.device)
+        return [concat, mask]
+
     def _build_conditioning(self, metadata):
-        """Build conditioning from metadata (same as parent class)."""
+        """Build conditioning, using cached CLIP/T5 features when available."""
         conditioner = self.diffusion.conditioner
         conditioning = {}
 
         for key, cond_module in conditioner.conditioners.items():
             if key == "video":
                 continue
+
+            if key == "prompt" and self._cond_cache_enabled and self._cached_prompt is not None:
+                # Use cached T5 features — check if any sample has empty prompt (CFG null)
+                has_null = any(m.get("prompt", "") == "" for m in metadata)
+                has_real = any(m.get("prompt", "") != "" for m in metadata)
+                if not has_null:
+                    # All real prompts (same text) — tile cached features
+                    features, mask = self._cached_prompt
+                    bs = len(metadata)
+                    conditioning[key] = [
+                        features.expand(bs, -1, -1),
+                        mask.expand(bs, -1),
+                    ]
+                elif not has_real:
+                    # All null prompts
+                    features, mask = self._null_prompt
+                    bs = len(metadata)
+                    conditioning[key] = [
+                        features.expand(bs, -1, -1),
+                        mask.expand(bs, -1),
+                    ]
+                else:
+                    # Mixed: build per-sample
+                    real_f, real_m = self._cached_prompt
+                    null_f, null_m = self._null_prompt
+                    f_list = []
+                    m_list = []
+                    for m in metadata:
+                        if m.get("prompt", "") == "":
+                            f_list.append(null_f)
+                            m_list.append(null_m)
+                        else:
+                            f_list.append(real_f)
+                            m_list.append(real_m)
+                    conditioning[key] = [
+                        torch.cat(f_list, dim=0),
+                        torch.cat(m_list, dim=0),
+                    ]
+                continue
+
             inputs = [m[key] for m in metadata]
             conditioning[key] = cond_module(inputs, self.device)
 
@@ -361,7 +513,16 @@ class RobotFineTuneTrainingWrapper(pl.LightningModule):
                 features = cond_module.proj_out(features)
                 conditioning[key] = [features, mask]
 
-        conditioning["video"] = self._encode_images_clip(metadata)
+        # CLIP features: use cache if available
+        if self._cond_cache_enabled:
+            cached = self._get_cached_clip(metadata)
+            if cached is not None:
+                conditioning["video"] = cached
+            else:
+                conditioning["video"] = self._encode_images_clip(metadata)
+        else:
+            conditioning["video"] = self._encode_images_clip(metadata)
+
         return conditioning
 
     def training_step(self, batch, batch_idx):
@@ -379,17 +540,19 @@ class RobotFineTuneTrainingWrapper(pl.LightningModule):
         conditioning = self._build_conditioning(metadata)
 
         if self.cfg_dropout_prob > 0 and self.training:
-            mask = torch.rand(batch_size, device=self.device) < self.cfg_dropout_prob
-            if mask.any():
+            drop_mask = torch.rand(batch_size, device=self.device) < self.cfg_dropout_prob
+            if drop_mask.any():
                 null_meta = [{
                     "prompt": "",
                     "camera_images": [img * 0 for img in m["camera_images"]],
                     "proprio": m["proprio"] * 0,
+                    "_sample_key": None,  # signals null for cache lookup
                 } for m in metadata]
-                null_cond = self._build_conditioning(
-                    [null_meta[i] if mask[i] else metadata[i] for i in range(batch_size)]
-                )
-                conditioning = null_cond
+                mixed_meta = [
+                    null_meta[i] if drop_mask[i] else metadata[i]
+                    for i in range(batch_size)
+                ]
+                conditioning = self._build_conditioning(mixed_meta)
 
         cond_inputs = self.diffusion.get_conditioning_inputs(conditioning)
 

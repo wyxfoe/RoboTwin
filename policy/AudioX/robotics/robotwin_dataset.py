@@ -57,6 +57,7 @@ class RoboTwinDataset(Dataset):
         augment=False,
         max_episodes=None,
         action_stats=None,
+        cache_in_memory=True,
     ):
         super().__init__()
         self.action_chunk_size = action_chunk_size
@@ -65,6 +66,7 @@ class RoboTwinDataset(Dataset):
         self.task_description = task_description
         self.normalize = normalize
         self.augment = augment
+        self.cache_in_memory = cache_in_memory
 
         # Discover episode files
         patterns = [
@@ -99,12 +101,36 @@ class RoboTwinDataset(Dataset):
         self.samples = []   # list of (episode_idx, start_t)
         all_actions = []
 
+        # In-memory cache: _ep_actions[ep_idx] = (T, action_dim) array
+        #                   _ep_images[ep_idx][cam_idx] = dict { t: (C,H,W) array }
+        self._ep_actions = {}
+        self._ep_images = {}
+
         for ep_idx, ep_path in enumerate(self.episode_paths):
             with h5py.File(ep_path, "r") as f:
                 actions = f["joint_action"]["vector"][:]  # (T, action_dim)
-            ep_len = actions.shape[0]
-            self.episodes.append((ep_path, ep_len))
-            all_actions.append(actions)
+                ep_len = actions.shape[0]
+                self.episodes.append((ep_path, ep_len))
+                all_actions.append(actions)
+
+                if cache_in_memory:
+                    self._ep_actions[ep_idx] = actions
+                    self._ep_images[ep_idx] = {}
+                    # Preload and decode all unique timestep images
+                    timestep_set = set()
+                    num_chunks = max(1, ep_len - action_chunk_size + 1)
+                    for t in range(num_chunks):
+                        timestep_set.add(t)
+                    for cam_idx, cam_name in enumerate(self.camera_names):
+                        cam_key = f"observation/{cam_name}/rgb"
+                        cam_cache = {}
+                        if cam_key in f:
+                            for t in timestep_set:
+                                jpeg_bytes = f[cam_key][t]
+                                img = _decode_jpeg(jpeg_bytes)
+                                img = _preprocess_image(img, self.image_size)
+                                cam_cache[t] = img
+                        self._ep_images[ep_idx][cam_idx] = cam_cache
 
             # Create samples: every possible chunk start
             num_chunks = max(1, ep_len - action_chunk_size + 1)
@@ -119,7 +145,8 @@ class RoboTwinDataset(Dataset):
 
         print(f"[RoboTwinDataset] {len(self.episode_paths)} episodes, "
               f"{len(self.samples)} samples, "
-              f"action_dim={all_actions[0].shape[1]}")
+              f"action_dim={all_actions[0].shape[1]}, "
+              f"cache_in_memory={cache_in_memory}")
 
     def __len__(self):
         return len(self.samples)
@@ -128,32 +155,47 @@ class RoboTwinDataset(Dataset):
         ep_idx, start_t = self.samples[idx]
         ep_path, ep_len = self.episodes[ep_idx]
 
-        with h5py.File(ep_path, "r") as f:
-            # --- Actions ---
+        if self.cache_in_memory:
+            # Fast path: read from memory cache (no HDF5 I/O)
+            all_actions = self._ep_actions[ep_idx]
             end_t = min(start_t + self.action_chunk_size, ep_len)
-            actions = f["joint_action"]["vector"][start_t:end_t]  # (chunk, dim)
-            actions = actions.astype(np.float32)
+            actions = all_actions[start_t:end_t].astype(np.float32)
 
-            # Pad if chunk shorter than target
             if actions.shape[0] < self.action_chunk_size:
                 pad = np.tile(actions[-1:], (self.action_chunk_size - actions.shape[0], 1))
                 actions = np.concatenate([actions, pad], axis=0)
 
-            # --- Proprio state (at start timestep) ---
-            proprio = f["joint_action"]["vector"][start_t].astype(np.float32)
+            proprio = all_actions[start_t].astype(np.float32)
 
-            # --- Camera images (at start timestep) ---
             frames = []
-            for cam_name in self.camera_names:
-                cam_key = f"observation/{cam_name}/rgb"
-                if cam_key not in f:
-                    # Skip missing cameras, use zeros
+            for cam_idx in range(len(self.camera_names)):
+                cam_cache = self._ep_images[ep_idx].get(cam_idx, {})
+                if start_t in cam_cache:
+                    frames.append(cam_cache[start_t])
+                else:
                     frames.append(np.zeros((3, self.image_size, self.image_size), dtype=np.float32))
-                    continue
-                jpeg_bytes = f[cam_key][start_t]
-                img = _decode_jpeg(jpeg_bytes)
-                img = _preprocess_image(img, self.image_size)
-                frames.append(img)
+        else:
+            # Slow path: read from HDF5
+            with h5py.File(ep_path, "r") as f:
+                end_t = min(start_t + self.action_chunk_size, ep_len)
+                actions = f["joint_action"]["vector"][start_t:end_t].astype(np.float32)
+
+                if actions.shape[0] < self.action_chunk_size:
+                    pad = np.tile(actions[-1:], (self.action_chunk_size - actions.shape[0], 1))
+                    actions = np.concatenate([actions, pad], axis=0)
+
+                proprio = f["joint_action"]["vector"][start_t].astype(np.float32)
+
+                frames = []
+                for cam_name in self.camera_names:
+                    cam_key = f"observation/{cam_name}/rgb"
+                    if cam_key not in f:
+                        frames.append(np.zeros((3, self.image_size, self.image_size), dtype=np.float32))
+                        continue
+                    jpeg_bytes = f[cam_key][start_t]
+                    img = _decode_jpeg(jpeg_bytes)
+                    img = _preprocess_image(img, self.image_size)
+                    frames.append(img)
 
         # Normalize actions to [-1, 1]
         actions_t = torch.from_numpy(actions)
@@ -174,6 +216,7 @@ class RoboTwinDataset(Dataset):
             "prompt": self.task_description,
             "camera_images": camera_images,
             "proprio": proprio_tensor,
+            "_sample_key": (ep_idx, start_t),
         }
 
         return actions_t, metadata
@@ -199,6 +242,7 @@ def create_robotwin_dataloader(
     augment=False,
     shuffle=True,
     action_stats=None,
+    cache_in_memory=True,
 ):
     """Create a DataLoader and Dataset for RoboTwin training.
 
@@ -215,17 +259,21 @@ def create_robotwin_dataloader(
         augment=augment,
         max_episodes=max_episodes,
         action_stats=action_stats,
+        cache_in_memory=cache_in_memory,
     )
+
+    # When data is cached in memory, workers add overhead without benefit
+    effective_workers = 0 if dataset.cache_in_memory else num_workers
 
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
-        num_workers=num_workers,
+        num_workers=effective_workers,
         pin_memory=True,
         drop_last=True,
         collate_fn=_collate_fn,
-        persistent_workers=num_workers > 0,
+        persistent_workers=effective_workers > 0,
     )
 
     return dataloader, dataset
