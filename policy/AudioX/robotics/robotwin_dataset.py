@@ -3,6 +3,9 @@
 HDF5 structure (per episode):
     observation/<camera>/rgb   — (T,) JPEG-encoded byte strings
     joint_action/vector        — (T, action_dim) float32
+
+Supports multi-task training: pass a list of (data_dir, task_description)
+pairs, or a single data_dir string for single-task mode.
 """
 
 import glob
@@ -13,7 +16,7 @@ import cv2
 import h5py
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
 
 from .action_space import normalize_actions, compute_action_stats
 
@@ -119,7 +122,8 @@ class RoboTwinDataset(Dataset):
 
         print(f"[RoboTwinDataset] {len(self.episode_paths)} episodes, "
               f"{len(self.samples)} samples, "
-              f"action_dim={all_actions[0].shape[1]}")
+              f"action_dim={all_actions[0].shape[1]}, "
+              f"task=\"{task_description}\"")
 
     def __len__(self):
         return len(self.samples)
@@ -164,9 +168,6 @@ class RoboTwinDataset(Dataset):
         actions_t = actions_t.T  # (action_dim, chunk_size)
 
         # Build metadata dict for conditioner
-        # Each camera image is a separate (C, H, W) tensor with CLIP normalization.
-        # Training code will process each through CLIP independently and concatenate
-        # the token sequences (RDT-style), instead of using temporal transformer.
         camera_images = [torch.from_numpy(frame) for frame in frames]  # list of (C, H, W)
         proprio_tensor = torch.from_numpy(proprio)
 
@@ -177,6 +178,79 @@ class RoboTwinDataset(Dataset):
         }
 
         return actions_t, metadata
+
+
+class MultiTaskRoboTwinDataset(ConcatDataset):
+    """Concatenates multiple single-task RoboTwinDatasets with shared action stats.
+
+    Each task gets its own task_description that is passed as the "prompt"
+    conditioning to T5, allowing the model to distinguish tasks.
+
+    Usage:
+        dataset = MultiTaskRoboTwinDataset(
+            task_dirs=[
+                ("/path/to/beat_block_hammer/data", "use the hammer to beat the block"),
+                ("/path/to/lift_pot/data", "lift the pot with both hands"),
+            ],
+            ...
+        )
+    """
+
+    def __init__(
+        self,
+        task_dirs,
+        action_chunk_size=50,
+        image_size=224,
+        camera_names=None,
+        normalize=True,
+        augment=False,
+        max_episodes=None,
+    ):
+        # First pass: collect all actions across tasks for shared normalization
+        all_actions = []
+        for data_dir, _ in task_dirs:
+            patterns = [
+                os.path.join(data_dir, "episode*.hdf5"),
+                os.path.join(data_dir, "**", "episode*.hdf5"),
+                os.path.join(data_dir, "data", "episode*.hdf5"),
+            ]
+            ep_paths = []
+            for pat in patterns:
+                ep_paths.extend(sorted(glob.glob(pat, recursive=True)))
+            # Deduplicate
+            seen = set()
+            for p in ep_paths:
+                rp = os.path.realpath(p)
+                if rp not in seen:
+                    seen.add(rp)
+                    with h5py.File(p, "r") as f:
+                        all_actions.append(f["joint_action"]["vector"][:])
+
+        shared_stats = compute_action_stats(all_actions)
+        self.action_stats = shared_stats
+
+        # Second pass: create per-task datasets with shared stats
+        datasets = []
+        for data_dir, task_desc in task_dirs:
+            ds = RoboTwinDataset(
+                data_dir=data_dir,
+                action_chunk_size=action_chunk_size,
+                image_size=image_size,
+                camera_names=camera_names,
+                task_description=task_desc,
+                normalize=normalize,
+                augment=augment,
+                max_episodes=max_episodes,
+                action_stats=shared_stats,
+            )
+            datasets.append(ds)
+
+        super().__init__(datasets)
+
+        self.task_dirs = task_dirs
+        total_episodes = sum(len(d.episode_paths) for d in datasets)
+        print(f"[MultiTaskRoboTwinDataset] {len(task_dirs)} tasks, "
+              f"{total_episodes} total episodes, {len(self)} total samples")
 
 
 def _collate_fn(batch):
@@ -199,23 +273,38 @@ def create_robotwin_dataloader(
     augment=False,
     shuffle=True,
     action_stats=None,
+    task_dirs=None,
 ):
     """Create a DataLoader and Dataset for RoboTwin training.
+
+    For multi-task training, pass task_dirs as a list of (data_dir, task_description) tuples.
+    When task_dirs is provided, data_dir and task_description are ignored.
 
     Returns:
         (dataloader, dataset) tuple.
     """
-    dataset = RoboTwinDataset(
-        data_dir=data_dir,
-        action_chunk_size=action_chunk_size,
-        image_size=image_size,
-        camera_names=camera_names,
-        task_description=task_description,
-        normalize=normalize,
-        augment=augment,
-        max_episodes=max_episodes,
-        action_stats=action_stats,
-    )
+    if task_dirs is not None and len(task_dirs) > 0:
+        dataset = MultiTaskRoboTwinDataset(
+            task_dirs=task_dirs,
+            action_chunk_size=action_chunk_size,
+            image_size=image_size,
+            camera_names=camera_names,
+            normalize=normalize,
+            augment=augment,
+            max_episodes=max_episodes,
+        )
+    else:
+        dataset = RoboTwinDataset(
+            data_dir=data_dir,
+            action_chunk_size=action_chunk_size,
+            image_size=image_size,
+            camera_names=camera_names,
+            task_description=task_description,
+            normalize=normalize,
+            augment=augment,
+            max_episodes=max_episodes,
+            action_stats=action_stats,
+        )
 
     dataloader = DataLoader(
         dataset,

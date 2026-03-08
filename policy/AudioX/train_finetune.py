@@ -14,24 +14,26 @@ Loss:
       + λ · L_reconstruction (MSE round-trip in 14-dim action space)
 
 Usage:
-    # Fine-tune from AudioX pretrained checkpoint:
+    # Single-task fine-tune:
     python train_finetune.py \
         --config configs/robotx_finetune_1_2b.json \
         --audiox_ckpt /path/to/audiox_1.2b.ckpt \
         --data_dir /path/to/data \
+        --task_description "use the hammer to beat the block" \
         --batch_size 8
+
+    # Multi-task fine-tune:
+    python train_finetune.py \
+        --config configs/robotx_finetune_1_2b.json \
+        --audiox_ckpt /path/to/audiox_1.2b.ckpt \
+        --task /path/to/beat_block_hammer/data "use the hammer to beat the block" \
+        --task /path/to/lift_pot/data "lift the pot with both hands" \
+        --batch_size 4 --num_gpus 8
 
     # Resume from fine-tuning checkpoint:
     python train_finetune.py \
         --config configs/robotx_finetune_1_2b.json \
         --ckpt_path checkpoints/finetune/robotx-00010000.ckpt
-
-    # Multi-GPU fine-tuning:
-    python train_finetune.py \
-        --config configs/robotx_finetune_1_2b.json \
-        --audiox_ckpt /path/to/audiox_1.2b.ckpt \
-        --data_dir /path/to/data \
-        --num_gpus 4 --batch_size 4
 
     # Freeze DiT backbone (only train adapter layers):
     python train_finetune.py \
@@ -114,7 +116,10 @@ def main():
     parser.add_argument("--demo_every", type=int, default=2000)
 
     # Task
-    parser.add_argument("--task_description", type=str, default=None)
+    parser.add_argument("--task_description", type=str, default=None,
+                        help="Task description for single-task training (used as T5 prompt)")
+    parser.add_argument("--task", nargs=2, action="append", metavar=("DATA_DIR", "DESCRIPTION"),
+                        help="Multi-task: --task /path/to/data 'task description'. Can be repeated.")
     parser.add_argument("--max_episodes", type=int, default=None)
 
     args = parser.parse_args()
@@ -177,20 +182,36 @@ def main():
 
     # Create data loader
     print("\nCreating data loader...")
-    data_dir = dataset_config.get("data_dir")
-    if not data_dir:
-        raise ValueError("data_dir must be specified in config or via --data_dir")
 
     per_gpu_batch_size = dataset_config.get("batch_size", 8)
     total_batch_size = per_gpu_batch_size * args.num_gpus * args.num_nodes
     num_workers_per_gpu = dataset_config.get("num_workers", 4)
 
-    print(f"  Data directory: {data_dir}")
+    # Build task_dirs from --task arguments or fall back to --data_dir
+    task_dirs = None
+    if args.task:
+        task_dirs = [(d, desc) for d, desc in args.task]
+        print(f"  Multi-task training: {len(task_dirs)} tasks")
+        for i, (d, desc) in enumerate(task_dirs):
+            print(f"    [{i}] {d}")
+            print(f"        \"{desc}\"")
+    elif dataset_config.get("task_dirs"):
+        # Support task_dirs in config JSON as well
+        task_dirs = [(t["data_dir"], t["task_description"]) for t in dataset_config["task_dirs"]]
+        print(f"  Multi-task training (from config): {len(task_dirs)} tasks")
+        for i, (d, desc) in enumerate(task_dirs):
+            print(f"    [{i}] {d}")
+            print(f"        \"{desc}\"")
+
+    data_dir = dataset_config.get("data_dir")
+    if task_dirs is None and not data_dir:
+        raise ValueError("Must specify --data_dir, --task, or task_dirs in config")
+
     print(f"  Batch size per GPU: {per_gpu_batch_size}")
     print(f"  Total batch size: {total_batch_size}")
 
     train_dataloader, train_dataset = create_robotwin_dataloader(
-        data_dir=data_dir,
+        data_dir=data_dir or "",
         batch_size=per_gpu_batch_size,
         action_chunk_size=config.get("action_chunk_size", 50),
         image_size=dataset_config.get("image_size", 224),
@@ -201,9 +222,10 @@ def main():
         normalize=dataset_config.get("normalize", True),
         augment=dataset_config.get("augment", True),
         shuffle=True,
+        task_dirs=task_dirs,
     )
 
-    print(f"  Loaded {len(train_dataset)} samples from {len(train_dataset.episodes)} episodes")
+    print(f"  Loaded {len(train_dataset)} total samples")
 
     # Save action stats
     os.makedirs(args.save_dir, exist_ok=True)
