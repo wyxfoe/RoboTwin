@@ -523,40 +523,85 @@ class RobotDemoCallback(pl.callbacks.Callback):
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         if trainer.global_step > 0 and trainer.global_step % self.demo_every == 0:
+            try:
             self._generate_demos(trainer, pl_module, batch)
+            except Exception as e:
+                print(f"[Demo] Step {trainer.global_step}: demo generation failed ({type(e).__name__}: {e}), skipping")
 
     @torch.no_grad()
     def _generate_demos(self, trainer, pl_module, batch):
-        """Generate and log demo trajectories."""
+        """Generate and log demo trajectories using manual diffusion sampling.
+
+        Bypasses generate_diffusion_cond to avoid CFG batch-doubling issues
+        with the AudioX DiT when conditioning tensors are pre-built.
+        Instead, performs the diffusion sampling loop directly.
+        """
         actions, metadata = batch
         n = min(self.num_demos, actions.shape[0])
-
-        try:
-            from audiox.inference.generation import generate_diffusion_cond
-        except ImportError:
-            return  # Skip if inference module unavailable
 
         model = pl_module.diffusion
         model_config = getattr(model, "_config", {})
         sample_size = model_config.get("sample_size", actions.shape[2])
-        sample_rate = model_config.get("sample_rate", 1)
 
-        # Pre-compute conditioning tensors (maps camera_images → video, etc.)
+        # Pre-compute conditioning tensors via the training wrapper's
+        # _build_conditioning (which correctly maps camera_images → video).
         demo_meta = metadata[:n]
         conditioning_tensors = pl_module._build_conditioning(demo_meta)
 
+        # Convert conditioning_tensors → model inputs (cross_attn_cond, etc.)
+        conditioning_inputs = model.get_conditioning_inputs(conditioning_tensors)
+
+        # Cast to model dtype
+        model_dtype = next(model.model.parameters()).dtype
+        conditioning_inputs = {
+            k: v.to(dtype=model_dtype) if v is not None else v
+            for k, v in conditioning_inputs.items()
+        }
+
         for cfg_scale in self.demo_cfg_scales:
-            preds = generate_diffusion_cond(
-                model,
-                conditioning_tensors=conditioning_tensors,
-                sample_size=sample_size,
-                sample_rate=sample_rate,
-                device=pl_module.device,
-                steps=self.demo_steps,
-                cfg_scale=cfg_scale,
+            # Create noise
+            noise = torch.randn(
+                [n, model.io_channels, sample_size],
+                device=pl_module.device, dtype=model_dtype,
             )
 
-            # Decode from 64-dim latent space to 14-dim action space
+            # Use the diffusion model's forward directly (no CFG) for
+            # cfg_scale=1.0.  For cfg_scale>1, we do manual CFG here
+            # to avoid the batch-doubling issue in generate_diffusion_cond.
+            from audiox.inference.sampling import sample_k
+
+            if cfg_scale == 1.0:
+                # No CFG — pass cfg_scale=1.0 so DiT skips batch doubling
+                preds = sample_k(
+                    model.model, noise, None, None, self.demo_steps,
+                    **conditioning_inputs,
+                    cfg_scale=1.0, batch_cfg=True, rescale_cfg=False,
+                    device=pl_module.device,
+                )
+            else:
+                # Manual CFG: run conditioned and unconditioned separately,
+                # then combine.  This avoids the batch-concat dimension
+                # mismatch inside DiffusionTransformer.
+                preds_cond = sample_k(
+                    model.model, noise, None, None, self.demo_steps,
+                    **conditioning_inputs,
+                    cfg_scale=1.0, batch_cfg=True, rescale_cfg=False,
+                device=pl_module.device,
+                )
+                # Unconditioned: zero out cross-attention conditioning
+                uncond_inputs = {
+                    k: (torch.zeros_like(v) if v is not None else v)
+                    for k, v in conditioning_inputs.items()
+                }
+                preds_uncond = sample_k(
+                    model.model, noise, None, None, self.demo_steps,
+                    **uncond_inputs,
+                    cfg_scale=1.0, batch_cfg=True, rescale_cfg=False,
+                    device=pl_module.device,
+            )
+                preds = preds_uncond + cfg_scale * (preds_cond - preds_uncond)
+
+            # Decode from latent space (64-dim) back to action space (14-dim).
             preds = model.decode_latent(preds)
 
             # Compute MSE against ground truth
