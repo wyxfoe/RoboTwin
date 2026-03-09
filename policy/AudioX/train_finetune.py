@@ -139,6 +139,9 @@ def main():
                              "natural (proportional to data size), custom (use --task_weights)")
     parser.add_argument("--task_weights", type=float, nargs="+", default=None,
                         help="Per-task weights for strategy=custom (e.g. --task_weights 1.0 2.0 0.5)")
+    parser.add_argument("--sampling_temperature", type=float, default=1.0,
+                        help="Temperature for task weight smoothing: "
+                             "T>1 → more uniform, T<1 → sharper, T=1 → no change (default 1.0)")
 
     args = parser.parse_args()
 
@@ -228,6 +231,7 @@ def main():
     print(f"  Total batch size: {total_batch_size}")
     if task_dirs:
         print(f"  Sampling strategy: {args.sampling_strategy}")
+        print(f"  Sampling temperature: {args.sampling_temperature}")
         if args.task_weights:
             print(f"  Task weights: {args.task_weights}")
 
@@ -246,6 +250,7 @@ def main():
         task_dirs=task_dirs,
         sampling_strategy=args.sampling_strategy,
         task_weights=args.task_weights,
+        sampling_temperature=args.sampling_temperature,
     )
 
     print(f"  Loaded {len(train_dataset)} total samples")

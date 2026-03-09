@@ -13,6 +13,7 @@ import cv2
 import h5py
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader, ConcatDataset, Sampler
 
 from .action_space import normalize_actions, compute_action_stats
@@ -259,6 +260,11 @@ class WeightedTaskSampler(Sampler):
     exposure during training. This prevents dominant tasks from drowning out
     smaller tasks and improves cross-task transfer.
 
+    Supports DDP: each rank samples a disjoint subset of indices per epoch.
+    Call ``set_epoch(epoch)`` before each epoch to ensure different shuffles
+    across epochs (following the DistributedSampler convention used by
+    OpenVLA, DexVLA, and other mainstream VLA frameworks).
+
     Weighting strategies:
         "uniform":    All tasks sampled equally regardless of size.
                       Weight per sample = 1 / (num_tasks * task_size).
@@ -268,12 +274,21 @@ class WeightedTaskSampler(Sampler):
                       natural size (equivalent to standard shuffled sampling).
         "custom":     User-specified per-task weights via task_weights arg.
 
+    Temperature (following RDT convention):
+        When temperature != 1.0, raw task-level weights are raised to
+        the power of (1 / temperature) before normalization:
+            w_i' = w_i^(1/T) / sum(w_j^(1/T))
+        T → 0: converges to argmax (only largest-weight task sampled).
+        T = 1: no change.
+        T → ∞: converges to uniform sampling.
+
     Args:
         dataset: A MultiTaskRoboTwinDataset (ConcatDataset of per-task datasets).
         strategy: One of "uniform", "sqrt", "natural", "custom".
         task_weights: List of floats, one per task. Only used when strategy="custom".
         num_samples: Total samples per epoch. Defaults to len(dataset).
-        generator: Optional torch.Generator for reproducibility.
+        temperature: Smoothing temperature applied to task weights (default 1.0).
+        seed: Base random seed for reproducibility across DDP ranks.
     """
 
     def __init__(
@@ -282,7 +297,8 @@ class WeightedTaskSampler(Sampler):
         strategy="uniform",
         task_weights=None,
         num_samples=None,
-        generator=None,
+        temperature=1.0,
+        seed=0,
     ):
         if not isinstance(dataset, ConcatDataset):
             raise TypeError(
@@ -291,8 +307,25 @@ class WeightedTaskSampler(Sampler):
             )
 
         self.dataset = dataset
-        self.num_samples = num_samples or len(dataset)
-        self.generator = generator
+        self.seed = seed
+        self.epoch = 0
+        self.temperature = temperature
+
+        # DDP awareness (matches DistributedSampler convention)
+        if dist.is_available() and dist.is_initialized():
+            self.rank = dist.get_rank()
+            self.world_size = dist.get_world_size()
+        else:
+            self.rank = 0
+            self.world_size = 1
+
+        total_dataset_size = len(dataset)
+        # Per-rank sample count (round up so all ranks get the same count)
+        if num_samples is not None:
+            self.total_samples = num_samples
+        else:
+            self.total_samples = total_dataset_size
+        self.num_samples = math.ceil(self.total_samples / self.world_size)
 
         # Build per-task sizes from the ConcatDataset's cumulative_sizes
         task_sizes = []
@@ -304,15 +337,12 @@ class WeightedTaskSampler(Sampler):
 
         # Compute per-task target weights
         if strategy == "uniform":
-            # Each task gets equal total weight
             target_weights = [1.0 / num_tasks] * num_tasks
         elif strategy == "sqrt":
-            # Weight proportional to sqrt(task_size)
             sqrt_sizes = [math.sqrt(s) for s in task_sizes]
             total_sqrt = sum(sqrt_sizes)
             target_weights = [s / total_sqrt for s in sqrt_sizes]
         elif strategy == "natural":
-            # Weight proportional to task size (no rebalancing)
             total = sum(task_sizes)
             target_weights = [s / total for s in task_sizes]
         elif strategy == "custom":
@@ -329,9 +359,16 @@ class WeightedTaskSampler(Sampler):
                 "Choose from: uniform, sqrt, natural, custom."
             )
 
+        # Apply temperature scaling (RDT-style)
+        if temperature != 1.0 and temperature > 0:
+            inv_t = 1.0 / temperature
+            target_weights = [w ** inv_t for w in target_weights]
+            total_w = sum(target_weights)
+            target_weights = [w / total_w for w in target_weights]
+
         # Convert target task weights to per-sample weights
         # sample_weight[i] = target_weight[task_of_i] / task_size[task_of_i]
-        sample_weights = torch.zeros(len(dataset), dtype=torch.float64)
+        sample_weights = torch.zeros(total_dataset_size, dtype=torch.float64)
         offset = 0
         for task_idx, task_size in enumerate(task_sizes):
             w = target_weights[task_idx] / task_size
@@ -340,19 +377,37 @@ class WeightedTaskSampler(Sampler):
 
         self.sample_weights = sample_weights
 
-        # Log effective distribution
-        print(f"[WeightedTaskSampler] strategy={strategy}, {num_tasks} tasks, "
-              f"{self.num_samples} samples/epoch")
-        for i, (ts, tw) in enumerate(zip(task_sizes, target_weights)):
-            print(f"  task[{i}]: {ts} samples, target weight={tw:.4f}")
+        # Log effective distribution (only on rank 0)
+        if self.rank == 0:
+            print(f"[WeightedTaskSampler] strategy={strategy}, temperature={temperature}, "
+                  f"{num_tasks} tasks, {self.total_samples} total samples/epoch, "
+                  f"world_size={self.world_size}")
+            for i, (ts, tw) in enumerate(zip(task_sizes, target_weights)):
+                print(f"  task[{i}]: {ts} samples, target weight={tw:.4f}")
+
+    def set_epoch(self, epoch):
+        """Set epoch number to change the random seed for shuffling per epoch.
+
+        This follows the DistributedSampler convention and ensures different
+        sampling orders across epochs for better training convergence.
+        """
+        self.epoch = epoch
 
     def __iter__(self):
-        indices = torch.multinomial(
+        # Create a generator seeded by epoch + rank for reproducibility
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+
+        # Sample indices for all ranks, then slice for this rank
+        all_indices = torch.multinomial(
             self.sample_weights,
-            num_samples=self.num_samples,
+            num_samples=self.num_samples * self.world_size,
             replacement=True,
-            generator=self.generator,
+            generator=g,
         )
+
+        # Each rank takes its own slice
+        indices = all_indices[self.rank::self.world_size]
         yield from indices.tolist()
 
     def __len__(self):
@@ -382,6 +437,7 @@ def create_robotwin_dataloader(
     task_dirs=None,
     sampling_strategy="uniform",
     task_weights=None,
+    sampling_temperature=1.0,
 ):
     """Create a DataLoader and Dataset for RoboTwin training.
 
@@ -392,6 +448,7 @@ def create_robotwin_dataloader(
         sampling_strategy: Weighting strategy for multi-task sampling.
             "uniform" — equal task exposure, "sqrt" — sqrt-balanced,
             "natural" — proportional to data size, "custom" — use task_weights.
+        sampling_temperature: Temperature for smoothing task weights (default 1.0).
         task_weights: Per-task weight list for strategy="custom".
 
     Returns:
@@ -414,6 +471,7 @@ def create_robotwin_dataloader(
             dataset=dataset,
             strategy=sampling_strategy,
             task_weights=task_weights,
+            temperature=sampling_temperature,
         )
     else:
         dataset = RoboTwinDataset(
