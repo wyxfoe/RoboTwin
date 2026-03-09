@@ -13,7 +13,7 @@ import cv2
 import h5py
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, ConcatDataset, Sampler
 
 from .action_space import normalize_actions, compute_action_stats
 
@@ -179,6 +179,186 @@ class RoboTwinDataset(Dataset):
         return actions_t, metadata
 
 
+class MultiTaskRoboTwinDataset(ConcatDataset):
+    """Concatenates multiple single-task RoboTwinDatasets with shared action stats.
+
+    Each task gets its own task_description that is passed as the "prompt"
+    conditioning to T5, allowing the model to distinguish tasks.
+
+    Usage:
+        dataset = MultiTaskRoboTwinDataset(
+            task_dirs=[
+                ("/path/to/beat_block_hammer/data", "use the hammer to beat the block"),
+                ("/path/to/lift_pot/data", "lift the pot with both hands"),
+            ],
+            ...
+        )
+    """
+
+    def __init__(
+        self,
+        task_dirs,
+        action_chunk_size=50,
+        image_size=224,
+        camera_names=None,
+        normalize=True,
+        augment=False,
+        max_episodes=None,
+    ):
+        # First pass: collect all actions across tasks for shared normalization
+        all_actions = []
+        for data_dir, _ in task_dirs:
+            patterns = [
+                os.path.join(data_dir, "episode*.hdf5"),
+                os.path.join(data_dir, "**", "episode*.hdf5"),
+                os.path.join(data_dir, "data", "episode*.hdf5"),
+            ]
+            ep_paths = []
+            for pat in patterns:
+                ep_paths.extend(sorted(glob.glob(pat, recursive=True)))
+            seen = set()
+            for p in ep_paths:
+                rp = os.path.realpath(p)
+                if rp not in seen:
+                    seen.add(rp)
+                    with h5py.File(p, "r") as f:
+                        all_actions.append(f["joint_action"]["vector"][:])
+
+        shared_stats = compute_action_stats(all_actions)
+        self.action_stats = shared_stats
+
+        # Second pass: create per-task datasets with shared stats
+        datasets = []
+        for data_dir, task_desc in task_dirs:
+            ds = RoboTwinDataset(
+                data_dir=data_dir,
+                action_chunk_size=action_chunk_size,
+                image_size=image_size,
+                camera_names=camera_names,
+                task_description=task_desc,
+                normalize=normalize,
+                augment=augment,
+                max_episodes=max_episodes,
+                action_stats=shared_stats,
+            )
+            datasets.append(ds)
+
+        super().__init__(datasets)
+
+        self.task_dirs = task_dirs
+        total_episodes = sum(len(d.episode_paths) for d in datasets)
+        print(f"[MultiTaskRoboTwinDataset] {len(task_dirs)} tasks, "
+              f"{total_episodes} total episodes, {len(self)} total samples")
+
+
+class WeightedTaskSampler(Sampler):
+    """Weighted random sampler for multi-task cross-task transfer learning.
+
+    Assigns per-sample weights based on which task each sample belongs to,
+    so that tasks with fewer samples can be upweighted to ensure balanced
+    exposure during training. This prevents dominant tasks from drowning out
+    smaller tasks and improves cross-task transfer.
+
+    Weighting strategies:
+        "uniform":    All tasks sampled equally regardless of size.
+                      Weight per sample = 1 / (num_tasks * task_size).
+        "sqrt":       Tasks weighted proportional to sqrt(task_size),
+                      a balanced compromise between uniform and natural.
+        "natural":    No reweighting; tasks sampled proportional to their
+                      natural size (equivalent to standard shuffled sampling).
+        "custom":     User-specified per-task weights via task_weights arg.
+
+    Args:
+        dataset: A MultiTaskRoboTwinDataset (ConcatDataset of per-task datasets).
+        strategy: One of "uniform", "sqrt", "natural", "custom".
+        task_weights: List of floats, one per task. Only used when strategy="custom".
+        num_samples: Total samples per epoch. Defaults to len(dataset).
+        generator: Optional torch.Generator for reproducibility.
+    """
+
+    def __init__(
+        self,
+        dataset,
+        strategy="uniform",
+        task_weights=None,
+        num_samples=None,
+        generator=None,
+    ):
+        if not isinstance(dataset, ConcatDataset):
+            raise TypeError(
+                "WeightedTaskSampler requires a ConcatDataset (MultiTaskRoboTwinDataset). "
+                f"Got {type(dataset).__name__}."
+            )
+
+        self.dataset = dataset
+        self.num_samples = num_samples or len(dataset)
+        self.generator = generator
+
+        # Build per-task sizes from the ConcatDataset's cumulative_sizes
+        task_sizes = []
+        prev = 0
+        for cs in dataset.cumulative_sizes:
+            task_sizes.append(cs - prev)
+            prev = cs
+        num_tasks = len(task_sizes)
+
+        # Compute per-task target weights
+        if strategy == "uniform":
+            # Each task gets equal total weight
+            target_weights = [1.0 / num_tasks] * num_tasks
+        elif strategy == "sqrt":
+            # Weight proportional to sqrt(task_size)
+            sqrt_sizes = [math.sqrt(s) for s in task_sizes]
+            total_sqrt = sum(sqrt_sizes)
+            target_weights = [s / total_sqrt for s in sqrt_sizes]
+        elif strategy == "natural":
+            # Weight proportional to task size (no rebalancing)
+            total = sum(task_sizes)
+            target_weights = [s / total for s in task_sizes]
+        elif strategy == "custom":
+            if task_weights is None or len(task_weights) != num_tasks:
+                raise ValueError(
+                    f"strategy='custom' requires task_weights with {num_tasks} entries, "
+                    f"got {task_weights}"
+                )
+            total_w = sum(task_weights)
+            target_weights = [w / total_w for w in task_weights]
+        else:
+            raise ValueError(
+                f"Unknown sampling strategy '{strategy}'. "
+                "Choose from: uniform, sqrt, natural, custom."
+            )
+
+        # Convert target task weights to per-sample weights
+        # sample_weight[i] = target_weight[task_of_i] / task_size[task_of_i]
+        sample_weights = torch.zeros(len(dataset), dtype=torch.float64)
+        offset = 0
+        for task_idx, task_size in enumerate(task_sizes):
+            w = target_weights[task_idx] / task_size
+            sample_weights[offset:offset + task_size] = w
+            offset += task_size
+
+        self.sample_weights = sample_weights
+
+        # Log effective distribution
+        print(f"[WeightedTaskSampler] strategy={strategy}, {num_tasks} tasks, "
+              f"{self.num_samples} samples/epoch")
+        for i, (ts, tw) in enumerate(zip(task_sizes, target_weights)):
+            print(f"  task[{i}]: {ts} samples, target weight={tw:.4f}")
+
+    def __iter__(self):
+        indices = torch.multinomial(
+            self.sample_weights,
+            num_samples=self.num_samples,
+            replacement=True,
+            generator=self.generator,
+        )
+        yield from indices.tolist()
+
+    def __len__(self):
+        return self.num_samples
+
+
 def _collate_fn(batch):
     """Custom collate: stack actions, keep metadata as list of dicts."""
     actions_list, meta_list = zip(*batch)
@@ -199,28 +379,60 @@ def create_robotwin_dataloader(
     augment=False,
     shuffle=True,
     action_stats=None,
+    task_dirs=None,
+    sampling_strategy="uniform",
+    task_weights=None,
 ):
     """Create a DataLoader and Dataset for RoboTwin training.
+
+    For multi-task training, pass task_dirs as a list of (data_dir, task_description)
+    tuples. When task_dirs is provided, data_dir and task_description are ignored.
+
+    Args:
+        sampling_strategy: Weighting strategy for multi-task sampling.
+            "uniform" — equal task exposure, "sqrt" — sqrt-balanced,
+            "natural" — proportional to data size, "custom" — use task_weights.
+        task_weights: Per-task weight list for strategy="custom".
 
     Returns:
         (dataloader, dataset) tuple.
     """
-    dataset = RoboTwinDataset(
-        data_dir=data_dir,
-        action_chunk_size=action_chunk_size,
-        image_size=image_size,
-        camera_names=camera_names,
-        task_description=task_description,
-        normalize=normalize,
-        augment=augment,
-        max_episodes=max_episodes,
-        action_stats=action_stats,
-    )
+    sampler = None
+
+    if task_dirs is not None and len(task_dirs) > 0:
+        dataset = MultiTaskRoboTwinDataset(
+            task_dirs=task_dirs,
+            action_chunk_size=action_chunk_size,
+            image_size=image_size,
+            camera_names=camera_names,
+            normalize=normalize,
+            augment=augment,
+            max_episodes=max_episodes,
+        )
+        # Use weighted sampler for multi-task training
+        sampler = WeightedTaskSampler(
+            dataset=dataset,
+            strategy=sampling_strategy,
+            task_weights=task_weights,
+        )
+    else:
+        dataset = RoboTwinDataset(
+            data_dir=data_dir,
+            action_chunk_size=action_chunk_size,
+            image_size=image_size,
+            camera_names=camera_names,
+            task_description=task_description,
+            normalize=normalize,
+            augment=augment,
+            max_episodes=max_episodes,
+            action_stats=action_stats,
+        )
 
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=(shuffle and sampler is None),
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
