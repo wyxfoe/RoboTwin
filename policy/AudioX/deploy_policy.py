@@ -98,6 +98,7 @@ def get_model(usr_args):
 
     action_dim = usr_args.get("action_dim", 16)
     action_chunk_size = usr_args.get("action_chunk_size", 50)
+    query_frequency = usr_args.get("query_frequency", action_chunk_size)
 
     # Arm dimensions from the eval framework (eval_policy.py sets these from embodiment config)
     left_arm_dim = usr_args.get("left_arm_dim", 6)
@@ -125,6 +126,7 @@ def get_model(usr_args):
         action_stats_path=action_stats_path,
         action_head_path=action_head_path,
     )
+    model.query_frequency = query_frequency
 
     return model
 
@@ -151,8 +153,8 @@ def eval(TASK_ENV, model, observation):
     input_rgb_arr, input_state = encode_obs(observation)
     model.update_observation_window(input_rgb_arr, input_state)
 
-    # Generate action chunk via diffusion
-    actions = model.get_action()[:model.action_chunk_size]
+    # Generate action chunk via diffusion, execute only query_frequency steps
+    actions = model.get_action()[:model.query_frequency]
 
     # Execute each action step
     for action in actions:
