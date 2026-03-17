@@ -44,7 +44,7 @@ action_head_path: null     # path to action_head.pt  (optional, identity if null
 # --- Action space ---
 action_dim: 14             # ALOHA-Agilex: (6+1)*2 = 14
 action_chunk_size: 50      # diffusion generates 50-step trajectory
-query_frequency: 50        # execute N steps before re-planning (default: same as chunk_size)
+query_frequency: 10        # execute N steps before re-planning (10 << 50 avoids trajectory drift)
 
 # --- Vision ---
 img_size: 224              # CLIP-ViT-B/32 input resolution
