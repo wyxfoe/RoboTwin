@@ -1,0 +1,76 @@
+# ============================================================================
+# NemoDiT Policy Configuration for RoboTwin
+# ============================================================================
+#
+# This configuration file defines the parameters for deploying NemoDiT policy
+# in the RoboTwin platform.
+#
+# Basic Parameters (keep unchanged for RoboTwin compatibility):
+#   - policy_name, task_name, task_config, ckpt_setting, seed, instruction_type
+#
+# Model Parameters (NemoDiT specific):
+#   - n_obs_steps, n_action_steps, ddim_steps, use_both_arms, quat_convention
+#
+# ============================================================================
+
+# Basic RoboTwin parameters (will be overridden by command line)
+policy_name: NemoDiT
+task_name: null
+task_config: null
+ckpt_setting: null
+seed: null
+instruction_type: unseen
+
+# Checkpoint settings
+expert_data_num: 100
+checkpoint_num: 500
+
+# Camera configuration
+head_camera_type: D435
+
+# ============================================================================
+# NemoDiT Model Parameters
+# ============================================================================
+
+# Action type: "endpose" or "joint"
+# - endpose: End-effector pose control (xyz + quaternion + gripper)
+#   - Single arm: 10D internal (8D output after rot6d->quat conversion)
+#   - Dual arm: 20D internal (16D output)
+# - joint: Joint position control (6D joint + gripper)
+#   - Single arm: 7D
+#   - Dual arm: 14D
+action_type: joint
+
+# Observation settings
+n_obs_steps: 2              # Number of observation history steps
+
+# Action settings
+n_action_steps: 8          # Number of action steps to execute per inference
+                            # Should be <= future_action_window from training
+
+# DDIM sampling settings
+ddim_steps: 10              # Number of DDIM denoising steps
+                            # Lower = faster but less accurate
+                            # Higher = slower but more accurate
+
+# Robot configuration
+use_both_arms: true         # Use dual arm mode
+                            # Set to false for single arm
+
+# Quaternion convention for output (only for action_type: endpose)
+quat_convention: wxyz       # Options: wxyz or xyzw
+                            # Must match RoboTwin environment expectation
+
+# ============================================================================
+# Advanced Settings (optional)
+# ============================================================================
+
+# Direct checkpoint path (overrides task_name based path)
+# checkpoint_path: null
+
+# Model architecture (these are read from checkpoint by default)
+# model_type: DiT-XL
+# token_size: 2048
+# vision_backbone: resnet50
+# adapter_type: mlp
+# future_action_window: 12
