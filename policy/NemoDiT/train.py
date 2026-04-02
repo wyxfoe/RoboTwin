@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
+from torch.profiler import profile, record_function, ProfilerActivity, schedule, tensorboard_trace_handler
 from torchvision import transforms
 from tqdm import tqdm
 import os
@@ -157,6 +158,27 @@ def parse_args():
                         help='WandB entity (username or team name)')
     parser.add_argument('--wandb_name', type=str, default=None,
                         help='WandB run name')
+
+    # Profiler arguments (torch.profiler)
+    # 使用 torch.profiler 分析训练过程中的计算和通信瓶颈
+    parser.add_argument('--use_profiler', action='store_true', default=False,
+                        help='Enable torch.profiler for performance analysis (default: False)')
+    parser.add_argument('--profiler_dir', type=str, default='profiler_logs',
+                        help='Directory to save profiler traces (default: profiler_logs)')
+    parser.add_argument('--profiler_wait', type=int, default=2,
+                        help='Profiler schedule: wait steps before warmup (default: 2)')
+    parser.add_argument('--profiler_warmup', type=int, default=2,
+                        help='Profiler schedule: warmup steps (default: 2)')
+    parser.add_argument('--profiler_active', type=int, default=6,
+                        help='Profiler schedule: active tracing steps (default: 6)')
+    parser.add_argument('--profiler_repeat', type=int, default=1,
+                        help='Profiler schedule: number of cycles to repeat (default: 1)')
+    parser.add_argument('--profiler_record_shapes', action='store_true', default=True,
+                        help='Record tensor shapes in profiler (default: True)')
+    parser.add_argument('--profiler_with_stack', action='store_true', default=False,
+                        help='Record stack traces in profiler (default: False)')
+    parser.add_argument('--profiler_with_flops', action='store_true', default=True,
+                        help='Estimate FLOPs for operators (default: True)')
 
     # 图像预处理选项
     # no_resize: 跳过 Resize 和 CenterCrop，保持原始图像尺寸
@@ -451,9 +473,38 @@ def train():
     if args.resume is not None:
         start_epoch, global_step = load_checkpoint(model, optimizer, scheduler, scaler, args.resume, ema_model)
 
+    # Setup torch.profiler (optional)
+    profiler = None
+    if args.use_profiler:
+        profiler_log_dir = os.path.join(args.profiler_dir, os.path.basename(args.checkpoint_dir))
+        os.makedirs(profiler_log_dir, exist_ok=True)
+        profiler_schedule = schedule(
+            wait=args.profiler_wait,
+            warmup=args.profiler_warmup,
+            active=args.profiler_active,
+            repeat=args.profiler_repeat,
+        )
+        profiler_activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
+        profiler = profile(
+            activities=profiler_activities,
+            schedule=profiler_schedule,
+            on_trace_ready=tensorboard_trace_handler(profiler_log_dir),
+            record_shapes=args.profiler_record_shapes,
+            profile_memory=True,
+            with_stack=args.profiler_with_stack,
+            with_flops=args.profiler_with_flops,
+        )
+        print(f"Profiler enabled: traces will be saved to {profiler_log_dir}")
+        print(f"  Schedule: wait={args.profiler_wait}, warmup={args.profiler_warmup}, "
+              f"active={args.profiler_active}, repeat={args.profiler_repeat}")
+        print(f"  View with: tensorboard --logdir={profiler_log_dir}")
+
     # Training loop
     print("Starting training...")
     model.train()
+
+    if profiler is not None:
+        profiler.start()
 
     for epoch in range(start_epoch, args.epochs):
         epoch_loss = 0.0
@@ -461,42 +512,48 @@ def train():
 
         for batch_idx, batch in enumerate(progress_bar):
             # Move data to device
-            images = batch['images'].to(device)  # (B, n_obs_steps, num_cameras, 3, H, W)
-            state = batch['state'].to(device)    # (B, action_dim) - 机器人当前状态
-            actions = batch['actions'].to(device)  # (B, future_window - 1, action_dim)
+            with record_function("data_transfer"):
+                images = batch['images'].to(device)  # (B, n_obs_steps, num_cameras, 3, H, W)
+                state = batch['state'].to(device)    # (B, action_dim) - 机器人当前状态
+                actions = batch['actions'].to(device)  # (B, future_window - 1, action_dim)
 
             optimizer.zero_grad()
 
             if args.use_amp:
                 # Mixed Precision Training
-                with autocast():
-                    loss = model.loss(x=actions, images=images, state=state)
+                with record_function("forward_amp"):
+                    with autocast():
+                        loss = model.loss(x=actions, images=images, state=state)
 
                 # Backward pass with gradient scaling
-                scaler.scale(loss).backward()
+                with record_function("backward_amp"):
+                    scaler.scale(loss).backward()
 
                 # Gradient clipping (unscale first for correct clipping)
-                if args.grad_clip > 0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
-
-                scaler.step(optimizer)
-                scaler.update()
+                with record_function("optimizer_step_amp"):
+                    if args.grad_clip > 0:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
             else:
                 # Standard FP32 Training
-                loss = model.loss(x=actions, images=images, state=state)
+                with record_function("forward"):
+                    loss = model.loss(x=actions, images=images, state=state)
 
-                loss.backward()
+                with record_function("backward"):
+                    loss.backward()
 
                 # Gradient clipping
-                if args.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
-
-                optimizer.step()
+                with record_function("optimizer_step"):
+                    if args.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
+                    optimizer.step()
 
             # Update EMA model
             if ema_model is not None:
-                ema_model.step(model)
+                with record_function("ema_update"):
+                    ema_model.step(model)
 
             # Update metrics
             epoch_loss += loss.item()
@@ -521,6 +578,10 @@ def train():
                 'lr': f'{optimizer.param_groups[0]["lr"]:.6f}'
             })
 
+            # Step profiler per batch
+            if profiler is not None:
+                profiler.step()
+
         # Update learning rate
         scheduler.step()
 
@@ -531,6 +592,25 @@ def train():
         # Save checkpoint
         if (epoch + 1) % args.save_every == 0:
             save_checkpoint(model, optimizer, scheduler, scaler, epoch + 1, global_step, args, ema_model=ema_model)
+
+    # Stop profiler and print summary
+    if profiler is not None:
+        profiler.stop()
+        print("\n" + "=" * 80)
+        print("PROFILER SUMMARY — CPU time sorted by CUDA total")
+        print("=" * 80)
+        print(profiler.key_averages().table(sort_by="cuda_time_total", row_limit=30))
+        print("\n" + "=" * 80)
+        print("PROFILER SUMMARY — Self CPU time")
+        print("=" * 80)
+        print(profiler.key_averages().table(sort_by="self_cpu_time_total", row_limit=30))
+        if args.profiler_with_flops:
+            print("\n" + "=" * 80)
+            print("PROFILER SUMMARY — FLOPs")
+            print("=" * 80)
+            print(profiler.key_averages().table(sort_by="flops", row_limit=20))
+        print(f"\nFull traces saved to: {profiler_log_dir}")
+        print(f"View with: tensorboard --logdir={profiler_log_dir}")
 
     # Save final checkpoint
     print("Training completed!")

@@ -61,6 +61,11 @@ grad_clip=1.0                 # Gradient clipping max norm
 num_workers=4                 # Number of data loading workers
 save_every=50                # Save checkpoint every N epochs
 
+# Profiler configuration (torch.profiler)
+# 启用后可分析训练中的计算/通信瓶颈，通过 TensorBoard 查看
+use_profiler=""               # Set to "--use_profiler" to enable profiling
+profiler_dir="profiler_logs"  # Profiler trace output directory
+
 # Camera configuration
 num_cameras=4                 # Number of camera views
 head_camera_type="D435"       # Head camera type
@@ -132,6 +137,8 @@ python train.py \
     --num_workers ${num_workers} \
     --checkpoint_dir ${checkpoint_dir} \
     --save_every ${save_every} \
+    ${use_profiler} \
+    --profiler_dir ${profiler_dir} \
     --device cuda:0
 
 echo -e "\033[32m[NemoDiT] Training completed!\033[0m"
