@@ -162,6 +162,13 @@ def parse_args():
     parser.add_argument('--profiler_with_flops', action='store_true', default=True,
                         help='Estimate FLOPs for operators (default: True)')
 
+    # torch.compile 优化
+    parser.add_argument('--use_compile', action='store_true', default=False,
+                        help='Use torch.compile to optimize the model (default: False)')
+    parser.add_argument('--compile_mode', type=str, default='default',
+                        choices=['default', 'reduce-overhead', 'max-autotune'],
+                        help='torch.compile mode (default: default)')
+
     # WandB arguments
     parser.add_argument('--use_wandb', action='store_true', default=False,
                         help='Use Weights & Biases for logging')
@@ -402,6 +409,14 @@ def train():
 
     # Create model
     model = create_model(args)
+
+    # torch.compile optimization (before DeepSpeed wrapping)
+    if args.use_compile:
+        if is_main:
+            print(f"Applying torch.compile (mode={args.compile_mode})...")
+        model = torch.compile(model, mode=args.compile_mode)
+        if is_main:
+            print("torch.compile applied successfully")
 
     if is_main:
         total_params = sum(p.numel() for p in model.parameters())

@@ -180,6 +180,13 @@ def parse_args():
     parser.add_argument('--profiler_with_flops', action='store_true', default=True,
                         help='Estimate FLOPs for operators (default: True)')
 
+    # torch.compile 优化
+    parser.add_argument('--use_compile', action='store_true', default=False,
+                        help='Use torch.compile to optimize the model (default: False)')
+    parser.add_argument('--compile_mode', type=str, default='default',
+                        choices=['default', 'reduce-overhead', 'max-autotune'],
+                        help='torch.compile mode (default: default)')
+
     # 图像预处理选项
     # no_resize: 跳过 Resize 和 CenterCrop，保持原始图像尺寸
     # 适用于所有相机图像尺寸一致的情况，可保留更多原始信息
@@ -421,6 +428,12 @@ def train():
     print("Creating model...")
     model = create_model(args)
     model = model.to(device)
+
+    # torch.compile optimization
+    if args.use_compile:
+        print(f"Applying torch.compile (mode={args.compile_mode})...")
+        model = torch.compile(model, mode=args.compile_mode)
+        print("torch.compile applied successfully")
 
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
