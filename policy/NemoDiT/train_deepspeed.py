@@ -185,11 +185,7 @@ def parse_args():
     parser.add_argument('--image_size', type=int, default=224,
                         help='Image size for vision backbone (default: 224)')
 
-    # DeepSpeed config path (also accepted via --deepspeed_config by deepspeed launcher)
-    parser.add_argument('--deepspeed_config', type=str, default='ds_config.json',
-                        help='Path to DeepSpeed config JSON file')
-
-    # DeepSpeed adds its own args (--local_rank, etc.) — let it parse
+    # DeepSpeed adds its own args (--local_rank, --deepspeed_config, etc.)
     parser = deepspeed.add_config_arguments(parser)
 
     args, _ = parser.parse_known_args()
