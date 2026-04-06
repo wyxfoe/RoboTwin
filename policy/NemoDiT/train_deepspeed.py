@@ -28,6 +28,7 @@ Features:
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
+from torch.cuda.amp import autocast
 from torch.profiler import profile, record_function, ProfilerActivity, schedule, tensorboard_trace_handler
 from torchvision import transforms
 from tqdm import tqdm
@@ -549,16 +550,19 @@ def train():
             progress_bar = dataloader
 
         for batch_idx, batch in enumerate(progress_bar):
-            # Move data to device and cast to model dtype (FP16 when DeepSpeed FP16 enabled)
+            # Move data to device
             with record_function("data_transfer"):
-                model_dtype = next(engine.module.parameters()).dtype
-                images = batch['images'].to(device=device, dtype=model_dtype)
-                state = batch['state'].to(device=device, dtype=model_dtype)
-                actions = batch['actions'].to(device=device, dtype=model_dtype)
+                images = batch['images'].to(device)
+                state = batch['state'].to(device)
+                actions = batch['actions'].to(device)
 
-            # Forward pass — DeepSpeed handles FP16/BF16 casting internally
+            # Forward pass — use autocast for FP16 to handle mixed dtypes in diffusion
             with record_function("forward"):
-                loss = engine.module.loss(x=actions, images=images, state=state)
+                if engine.fp16_enabled():
+                    with autocast():
+                        loss = engine.module.loss(x=actions, images=images, state=state)
+                else:
+                    loss = engine.module.loss(x=actions, images=images, state=state)
 
             # Backward pass — DeepSpeed handles gradient scaling and allreduce
             with record_function("backward"):
