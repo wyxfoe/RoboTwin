@@ -549,11 +549,12 @@ def train():
             progress_bar = dataloader
 
         for batch_idx, batch in enumerate(progress_bar):
-            # Move data to device
+            # Move data to device and cast to model dtype (FP16 when DeepSpeed FP16 enabled)
             with record_function("data_transfer"):
-                images = batch['images'].to(device)
-                state = batch['state'].to(device)
-                actions = batch['actions'].to(device)
+                model_dtype = next(engine.module.parameters()).dtype
+                images = batch['images'].to(device=device, dtype=model_dtype)
+                state = batch['state'].to(device=device, dtype=model_dtype)
+                actions = batch['actions'].to(device=device, dtype=model_dtype)
 
             # Forward pass — DeepSpeed handles FP16/BF16 casting internally
             with record_function("forward"):
