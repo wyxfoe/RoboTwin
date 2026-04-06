@@ -12,5 +12,5 @@
     },
 
     "zero_allow_untested_optimizer": true,
-    "wall_clock_breakdown": true
+    "wall_clock_breakdown": false
 }
