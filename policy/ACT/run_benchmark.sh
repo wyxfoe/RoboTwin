@@ -2,16 +2,18 @@
 # =============================================================================
 # HDF5 vs Zarr Data Format Benchmark for ACT Policy
 #
+# Tests three Zarr configurations against HDF5:
+#   1. Zarr (no compression)   — raw I/O baseline
+#   2. Zarr (DP preset)        — Blosc(zstd, clevel=3, shuffle=SHUFFLE),
+#                                same as Diffusion Policy process_data.py
+#   3. Zarr (DP-memory preset) — Blosc(lz4, clevel=5, shuffle=NOSHUFFLE),
+#                                same as DP ReplayBuffer in-memory default
+#
 # Usage:
 #   bash run_benchmark.sh <task_name> <task_config> <expert_data_num> [gpu_id]
 #
 # Example:
 #   bash run_benchmark.sh block_hammer_beat ActivePick 50 0
-#
-# Steps:
-#   1. Process raw data into HDF5 (if not already done)
-#   2. Convert HDF5 to Zarr (with multiple compression options)
-#   3. Run the benchmark suite
 # =============================================================================
 
 set -e
@@ -24,8 +26,10 @@ gpu_id=${4:-0}
 export CUDA_VISIBLE_DEVICES=${gpu_id}
 
 HDF5_DIR="./processed_data/sim-${task_name}/${task_config}-${expert_data_num}"
-ZARR_DIR_NONE="./processed_data_zarr/sim-${task_name}/${task_config}-${expert_data_num}_no_compress"
-ZARR_DIR_LZ4="./processed_data_zarr/sim-${task_name}/${task_config}-${expert_data_num}_lz4"
+ZARR_BASE="./processed_data_zarr/sim-${task_name}/${task_config}-${expert_data_num}"
+ZARR_DIR_NONE="${ZARR_BASE}_none"
+ZARR_DIR_DP="${ZARR_BASE}_dp"
+ZARR_DIR_DP_MEM="${ZARR_BASE}_dp_memory"
 
 echo "============================================="
 echo "  Data Format Benchmark: HDF5 vs Zarr"
@@ -47,61 +51,54 @@ else
     echo "[Step 1] HDF5 data already exists at ${HDF5_DIR}, skipping."
 fi
 
-# --- Step 2: Convert to Zarr (no compression) ---
-if [ ! -d "${ZARR_DIR_NONE}" ]; then
-    echo ""
-    echo "[Step 2a] Converting HDF5 -> Zarr (no compression) ..."
-    python3 convert_hdf5_to_zarr.py \
-        --dataset_dir "${HDF5_DIR}" \
-        --output_dir "${ZARR_DIR_NONE}" \
-        --num_episodes ${expert_data_num} \
-        --compressor none
-else
-    echo ""
-    echo "[Step 2a] Zarr (no compress) already exists, skipping."
-fi
+# --- Step 2: Convert to Zarr variants ---
+convert_if_missing() {
+    local label=$1
+    local dir=$2
+    local compressor=$3
+    if [ ! -d "${dir}" ]; then
+        echo ""
+        echo "[Convert] ${label} ..."
+        python3 convert_hdf5_to_zarr.py \
+            --dataset_dir "${HDF5_DIR}" \
+            --output_dir "${dir}" \
+            --num_episodes ${expert_data_num} \
+            --compressor ${compressor} \
+            --layout per_episode
+    else
+        echo "[Convert] ${label} already exists, skipping."
+    fi
+}
 
-# --- Step 2b: Convert to Zarr (LZ4) ---
-if [ ! -d "${ZARR_DIR_LZ4}" ]; then
-    echo ""
-    echo "[Step 2b] Converting HDF5 -> Zarr (LZ4) ..."
-    python3 convert_hdf5_to_zarr.py \
-        --dataset_dir "${HDF5_DIR}" \
-        --output_dir "${ZARR_DIR_LZ4}" \
-        --num_episodes ${expert_data_num} \
-        --compressor lz4
-else
-    echo ""
-    echo "[Step 2b] Zarr (LZ4) already exists, skipping."
-fi
+convert_if_missing "Zarr (no compression)"     "${ZARR_DIR_NONE}"   "none"
+convert_if_missing "Zarr (DP: zstd clevel=3)"  "${ZARR_DIR_DP}"     "dp"
+convert_if_missing "Zarr (DP-memory: lz4)"     "${ZARR_DIR_DP_MEM}" "dp-memory"
 
 # --- Step 3: Run benchmarks ---
-echo ""
-echo "[Step 3] Running benchmark: HDF5 vs Zarr (no compression) ..."
-python3 benchmark_data_formats.py \
-    --hdf5_dir "${HDF5_DIR}" \
-    --zarr_dir "${ZARR_DIR_NONE}" \
-    --num_episodes ${expert_data_num} \
-    --batch_size 8 \
-    --num_warmup 5 \
-    --num_iters 50 \
-    --output "benchmark_results_no_compress.json"
+run_benchmark() {
+    local label=$1
+    local zarr_dir=$2
+    local output=$3
+    echo ""
+    echo "[Benchmark] HDF5 vs ${label} ..."
+    python3 benchmark_data_formats.py \
+        --hdf5_dir "${HDF5_DIR}" \
+        --zarr_dir "${zarr_dir}" \
+        --num_episodes ${expert_data_num} \
+        --batch_size 8 \
+        --num_warmup 5 \
+        --num_iters 50 \
+        --output "${output}"
+}
 
-echo ""
-echo "[Step 4] Running benchmark: HDF5 vs Zarr (LZ4) ..."
-python3 benchmark_data_formats.py \
-    --hdf5_dir "${HDF5_DIR}" \
-    --zarr_dir "${ZARR_DIR_LZ4}" \
-    --num_episodes ${expert_data_num} \
-    --batch_size 8 \
-    --num_warmup 5 \
-    --num_iters 50 \
-    --output "benchmark_results_lz4.json"
+run_benchmark "Zarr (no compression)"     "${ZARR_DIR_NONE}"   "benchmark_results_none.json"
+run_benchmark "Zarr (DP: zstd clevel=3)"  "${ZARR_DIR_DP}"     "benchmark_results_dp.json"
+run_benchmark "Zarr (DP-memory: lz4)"     "${ZARR_DIR_DP_MEM}" "benchmark_results_dp_memory.json"
 
 echo ""
 echo "============================================="
-echo "  Benchmark complete!"
-echo "  Results saved to:"
-echo "    benchmark_results_no_compress.json"
-echo "    benchmark_results_lz4.json"
+echo "  Benchmark complete! Results saved to:"
+echo "    benchmark_results_none.json"
+echo "    benchmark_results_dp.json"
+echo "    benchmark_results_dp_memory.json"
 echo "============================================="
