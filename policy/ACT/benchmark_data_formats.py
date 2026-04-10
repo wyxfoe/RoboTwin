@@ -1,12 +1,27 @@
 """
-Benchmark HDF5 vs Zarr data loading for the ACT policy.
+Benchmark data loading for the ACT policy across a 2x2 matrix of
+(file format) x (loading strategy) to decouple the two variables:
 
-Measures:
-  1. Raw I/O latency  — single-item read speed (no DataLoader overhead)
-  2. DataLoader throughput — batches/sec across different num_workers & prefetch configs
+                          HDF5                     Zarr
+    Lazy (on-disk)    HDF5-lazy               Zarr-lazy
+    Eager (preload)   HDF5-eager              Zarr-eager
+
+    - Lazy   = open the file and read the timestep inside __getitem__
+               (what ACT currently does)
+    - Eager  = load all episodes once in __init__ into numpy arrays,
+               then slice from RAM inside __getitem__
+               (what DP does via ReplayBuffer.copy_from_path)
+
+Comparing (HDF5-lazy, Zarr-lazy) vs (HDF5-eager, Zarr-eager) isolates the
+format effect. Comparing (HDF5-lazy, HDF5-eager) vs (Zarr-lazy, Zarr-eager)
+isolates the loading strategy effect.
+
+Measures per cell:
+  1. Raw I/O latency  — single-item __getitem__ speed
+  2. DataLoader throughput — batches/sec under different worker configs
   3. GPU transfer time — data-to-CUDA overhead
-  4. End-to-end training step — full forward+backward with real ACT model
-  5. Memory footprint — peak RSS during data loading
+  4. End-to-end training step — forward+backward with real ACT model
+  5. Init time + peak RSS
 
 Usage:
     python benchmark_data_formats.py \
@@ -17,7 +32,7 @@ Usage:
         --num_warmup 5 \
         --num_iters 50
 
-Output: a structured report printed to stdout and saved as benchmark_results.json.
+Output: structured report printed to stdout and saved as benchmark_results.json.
 """
 
 import os
@@ -44,8 +59,9 @@ except ImportError:
 # Dataset implementations
 # ---------------------------------------------------------------------------
 
-class HDF5EpisodicDataset(torch.utils.data.Dataset):
-    """Episode dataset reading from HDF5 files (mirrors original utils.py)."""
+class HDF5LazyDataset(torch.utils.data.Dataset):
+    """HDF5 + lazy: open the file and read one timestep inside __getitem__.
+    Mirrors the original ACT utils.py behavior."""
 
     def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, max_action_len):
         self.episode_ids = episode_ids
@@ -89,8 +105,8 @@ class HDF5EpisodicDataset(torch.utils.data.Dataset):
         return image_data, qpos_data, action_data, is_pad
 
 
-class ZarrEpisodicDataset(torch.utils.data.Dataset):
-    """Episode dataset reading from Zarr stores."""
+class ZarrLazyDataset(torch.utils.data.Dataset):
+    """Zarr + lazy: open the Zarr store and read one timestep inside __getitem__."""
 
     def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, max_action_len):
         self.episode_ids = episode_ids
@@ -133,6 +149,94 @@ class ZarrEpisodicDataset(torch.utils.data.Dataset):
         qpos_data = (qpos_data - self.norm_stats["qpos_mean"]) / self.norm_stats["qpos_std"]
 
         return image_data, qpos_data, action_data, is_pad
+
+
+# ---------------------------------------------------------------------------
+# Eager (preload-to-RAM) datasets — mirror DP's ReplayBuffer strategy
+# ---------------------------------------------------------------------------
+
+class _EagerEpisodicDataset(torch.utils.data.Dataset):
+    """Shared postprocessing for eager datasets. Subclasses must populate
+    self.episodes as a list of dicts: {action, qpos, images: {cam_name: np.ndarray}}.
+    """
+
+    def __init__(self, camera_names, norm_stats, max_action_len):
+        self.camera_names = camera_names
+        self.norm_stats = norm_stats
+        self.max_action_len = max_action_len
+        self.episodes = []  # populated by subclass
+
+    def __len__(self):
+        return len(self.episodes)
+
+    def __getitem__(self, index):
+        ep = self.episodes[index]
+        action = ep["action"]
+        qpos_all = ep["qpos"]
+        episode_len = action.shape[0]
+        start_ts = np.random.randint(0, episode_len)
+
+        qpos = qpos_all[start_ts]
+        image_dict = {cam: ep["images"][cam][start_ts] for cam in self.camera_names}
+        action_slice = action[start_ts:]
+        action_len = episode_len - start_ts
+
+        padded_action = np.zeros((self.max_action_len, action_slice.shape[1]), dtype=np.float32)
+        padded_action[:action_len] = action_slice
+        is_pad = np.ones(self.max_action_len, dtype=bool)
+        is_pad[:action_len] = False
+
+        all_cam_images = np.stack([image_dict[c] for c in self.camera_names], axis=0)
+        image_data = torch.from_numpy(all_cam_images)
+        qpos_data = torch.from_numpy(qpos).float()
+        action_data = torch.from_numpy(padded_action).float()
+        is_pad = torch.from_numpy(is_pad).bool()
+
+        image_data = torch.einsum("k h w c -> k c h w", image_data)
+        image_data = image_data / 255.0
+        action_data = (action_data - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
+        qpos_data = (qpos_data - self.norm_stats["qpos_mean"]) / self.norm_stats["qpos_std"]
+
+        return image_data, qpos_data, action_data, is_pad
+
+
+class HDF5EagerDataset(_EagerEpisodicDataset):
+    """HDF5 + eager: load every episode into numpy arrays at __init__.
+    __getitem__ only touches RAM — no file I/O, no h5py, no decompression."""
+
+    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, max_action_len):
+        super().__init__(camera_names, norm_stats, max_action_len)
+        for ep_id in episode_ids:
+            path = os.path.join(dataset_dir, f"episode_{ep_id}.hdf5")
+            with h5py.File(path, "r") as f:
+                ep = {
+                    "action": f["/action"][()],
+                    "qpos": f["/observations/qpos"][()],
+                    "images": {
+                        cam: f[f"/observations/images/{cam}"][()] for cam in camera_names
+                    },
+                }
+            self.episodes.append(ep)
+
+
+class ZarrEagerDataset(_EagerEpisodicDataset):
+    """Zarr + eager: load every episode into numpy arrays at __init__.
+    Equivalent to DP's ReplayBuffer.copy_from_path(store=None) path,
+    which triggers arr[:] on every zarr array to decompress into numpy."""
+
+    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, max_action_len):
+        super().__init__(camera_names, norm_stats, max_action_len)
+        for ep_id in episode_ids:
+            path = os.path.join(dataset_dir, f"episode_{ep_id}.zarr")
+            root = zarr.open(path, mode="r")
+            ep = {
+                "action": root["action"][:],
+                "qpos": root["observations/qpos"][:],
+                "images": {
+                    cam: root[f"observations/images/{cam}"][:] for cam in camera_names
+                },
+            }
+            self.episodes.append(ep)
 
 
 # ---------------------------------------------------------------------------
@@ -408,40 +512,51 @@ def benchmark_training_step(dataset, batch_size, num_warmup, num_iters, label, c
 # Main benchmark orchestrator
 # ---------------------------------------------------------------------------
 
+def _build_dataset(cell, episode_ids, args, camera_names, norm_stats, max_action_len):
+    """Instantiate one of the four cells and return (dataset, init_seconds)."""
+    t0 = time.perf_counter()
+    if cell == "hdf5_lazy":
+        ds = HDF5LazyDataset(episode_ids, args.hdf5_dir, camera_names, norm_stats, max_action_len)
+    elif cell == "hdf5_eager":
+        ds = HDF5EagerDataset(episode_ids, args.hdf5_dir, camera_names, norm_stats, max_action_len)
+    elif cell == "zarr_lazy":
+        ds = ZarrLazyDataset(episode_ids, args.zarr_dir, camera_names, norm_stats, max_action_len)
+    elif cell == "zarr_eager":
+        ds = ZarrEagerDataset(episode_ids, args.zarr_dir, camera_names, norm_stats, max_action_len)
+    else:
+        raise ValueError(cell)
+    return ds, time.perf_counter() - t0
+
+
 def run_benchmarks(args):
     print("=" * 70)
-    print("  HDF5 vs Zarr Data Format Benchmark for ACT Policy")
+    print("  2x2 Benchmark: (HDF5 vs Zarr) x (Lazy vs Eager)")
     print("=" * 70)
 
     camera_names = ["cam_high", "cam_right_wrist", "cam_left_wrist"]
 
-    # 1. Compute shared normalization stats
-    print("\n[1/5] Computing normalization statistics from HDF5 ...")
+    # Compute shared normalization stats
+    print("\n[setup] Computing normalization statistics from HDF5 ...")
     norm_stats, max_action_len = get_norm_stats_from_hdf5(args.hdf5_dir, args.num_episodes)
     print(f"  max_action_len = {max_action_len}")
 
-    # 2. Build datasets
     episode_ids = list(range(args.num_episodes))
-    hdf5_ds = HDF5EpisodicDataset(episode_ids, args.hdf5_dir, camera_names, norm_stats, max_action_len)
+    zarr_ok = zarr is not None and args.zarr_dir and os.path.isdir(args.zarr_dir)
+    if not zarr_ok:
+        print(f"  Zarr unavailable (zarr_dir={args.zarr_dir}); skipping Zarr cells.")
 
-    zarr_ds = None
-    if zarr is not None and args.zarr_dir and os.path.isdir(args.zarr_dir):
-        zarr_ds = ZarrEpisodicDataset(episode_ids, args.zarr_dir, camera_names, norm_stats, max_action_len)
-    elif zarr is None:
-        print("  Zarr not available, skipping Zarr benchmarks.")
-    else:
-        print(f"  Zarr directory not found: {args.zarr_dir}")
+    # 2x2 matrix of cells to test
+    cells = ["hdf5_lazy", "hdf5_eager"]
+    if zarr_ok:
+        cells += ["zarr_lazy", "zarr_eager"]
 
     all_results = {}
 
-    # 3. Raw I/O latency
-    print(f"\n[2/5] Raw I/O latency (warmup={args.num_warmup}, iters={args.num_iters}) ...")
-    all_results.update(benchmark_raw_io(hdf5_ds, args.num_warmup, args.num_iters, "hdf5"))
-    if zarr_ds:
-        all_results.update(benchmark_raw_io(zarr_ds, args.num_warmup, args.num_iters, "zarr"))
+    # Allow skipping eager cells if they'd blow out RAM
+    if args.skip_eager:
+        cells = [c for c in cells if not c.endswith("eager")]
+        print("  --skip_eager set, eager cells skipped.")
 
-    # 4. DataLoader throughput — sweep num_workers and prefetch_factor
-    print(f"\n[3/5] DataLoader throughput (batch_size={args.batch_size}) ...")
     worker_configs = [
         (0, 2),    # main process, prefetch_factor ignored
         (1, 1),    # original ACT config
@@ -450,93 +565,144 @@ def run_benchmarks(args):
         (4, 4),
         (8, 2),
     ]
-    for nw, pf in worker_configs:
-        tag = f"  workers={nw}, prefetch={pf}"
-        print(tag)
-        all_results.update(benchmark_dataloader(
-            hdf5_ds, args.batch_size, nw, pf, args.num_warmup, args.num_iters, "hdf5"))
-        if zarr_ds:
+
+    for cell in cells:
+        print(f"\n{'=' * 70}\n  Cell: {cell}\n{'=' * 70}")
+        dataset, init_sec = _build_dataset(cell, episode_ids, args, camera_names, norm_stats, max_action_len)
+        all_results[f"{cell}/init_seconds"] = init_sec
+        all_results[f"{cell}/rss_after_init_mb"] = get_peak_rss_mb()
+        print(f"  init time: {init_sec:.2f}s   peak RSS so far: {get_peak_rss_mb():.0f} MB")
+
+        # 1. Raw I/O latency
+        print(f"\n  [1/4] Raw item latency (warmup={args.num_warmup}, iters={args.num_iters})")
+        all_results.update(benchmark_raw_io(dataset, args.num_warmup, args.num_iters, cell))
+
+        # 2. DataLoader throughput sweep
+        print(f"\n  [2/4] DataLoader throughput (batch_size={args.batch_size})")
+        for nw, pf in worker_configs:
+            print(f"    workers={nw}, prefetch={pf}")
             all_results.update(benchmark_dataloader(
-                zarr_ds, args.batch_size, nw, pf, args.num_warmup, args.num_iters, "zarr"))
+                dataset, args.batch_size, nw, pf, args.num_warmup, args.num_iters, cell))
 
-    # 5. GPU transfer
-    print(f"\n[4/5] GPU transfer time ...")
-    all_results.update(benchmark_gpu_transfer(hdf5_ds, args.batch_size, args.num_warmup, args.num_iters, "hdf5"))
-    if zarr_ds:
-        all_results.update(benchmark_gpu_transfer(zarr_ds, args.batch_size, args.num_warmup, args.num_iters, "zarr"))
+        # 3. GPU transfer
+        print(f"\n  [3/4] GPU transfer")
+        all_results.update(benchmark_gpu_transfer(dataset, args.batch_size, args.num_warmup, args.num_iters, cell))
 
-    # 6. End-to-end training step
-    print(f"\n[5/5] End-to-end training step ...")
-    all_results.update(benchmark_training_step(
-        hdf5_ds, args.batch_size, args.num_warmup, min(args.num_iters, 20), "hdf5", camera_names))
-    if zarr_ds:
-        all_results.update(benchmark_training_step(
-            zarr_ds, args.batch_size, args.num_warmup, min(args.num_iters, 20), "zarr", camera_names))
+        # 4. End-to-end training step
+        if not args.skip_training:
+            print(f"\n  [4/4] End-to-end training step")
+            all_results.update(benchmark_training_step(
+                dataset, args.batch_size, args.num_warmup, min(args.num_iters, 20), cell, camera_names))
+        else:
+            print(f"\n  [4/4] Skipped (--skip_training)")
 
-    # Peak memory
+        # Release memory before the next cell
+        del dataset
+
     all_results["peak_rss_mb"] = get_peak_rss_mb()
-
     return all_results
 
 
+CELL_LABELS = {
+    "hdf5_lazy":  "HDF5 lazy",
+    "hdf5_eager": "HDF5 eager",
+    "zarr_lazy":  "Zarr lazy",
+    "zarr_eager": "Zarr eager",
+}
+
+
+def _row(name, values, fmt=".2f", width=12):
+    """Print one row of the 2x2 comparison table."""
+    cells = []
+    for v in values:
+        if v is None:
+            cells.append(f"{'N/A':>{width}}")
+        else:
+            cells.append(f"{v:>{width}{fmt}}")
+    print(f"  {name:<30} " + "".join(cells))
+
+
 def print_report(results):
-    """Pretty-print the benchmark results as a comparison table."""
-    print("\n" + "=" * 70)
-    print("  BENCHMARK RESULTS")
-    print("=" * 70)
+    """Pretty-print the 2x2 matrix results.
+
+    Layout per metric:
+                          HDF5 lazy   HDF5 eager  Zarr lazy   Zarr eager
+        metric_name          ...         ...         ...         ...
+    """
+    cells = [c for c in ["hdf5_lazy", "hdf5_eager", "zarr_lazy", "zarr_eager"]
+             if any(k.startswith(c + "/") for k in results)]
+    labels = [CELL_LABELS[c] for c in cells]
+
+    def header(title):
+        print(f"\n--- {title} ---")
+        print(f"  {'Metric':<30} " + "".join(f"{l:>12}" for l in labels))
+        print("  " + "-" * (30 + 12 * len(cells)))
+
+    def get_vals(key_suffix):
+        return [results.get(f"{c}/{key_suffix}") for c in cells]
+
+    print("\n" + "=" * 90)
+    print("  2x2 BENCHMARK RESULTS  (rows = metric, columns = cell)")
+    print("=" * 90)
+
+    # --- Init time & RSS ---
+    header("Dataset init")
+    _row("init_seconds", get_vals("init_seconds"), fmt=".2f")
+    _row("rss_after_init_mb", get_vals("rss_after_init_mb"), fmt=".0f")
 
     # --- Raw I/O ---
-    print("\n--- Raw I/O Latency (ms) ---")
-    print(f"{'Metric':<30} {'HDF5':>12} {'Zarr':>12} {'Speedup':>10}")
-    print("-" * 66)
+    header("Raw __getitem__ latency (ms)")
     for suffix in ["mean_ms", "median_ms", "p95_ms", "p99_ms"]:
-        h = results.get(f"hdf5/raw_io/{suffix}", None)
-        z = results.get(f"zarr/raw_io/{suffix}", None)
-        speedup = f"{h/z:.2f}x" if (h and z) else "N/A"
-        print(f"  {suffix:<28} {h or 'N/A':>12.2f}" +
-              (f" {z:>12.2f} {speedup:>10}" if z else ""))
+        _row(suffix, get_vals(f"raw_io/{suffix}"), fmt=".2f")
 
     # --- DataLoader ---
-    print("\n--- DataLoader Throughput (samples/sec) ---")
-    print(f"{'Config':<25} {'HDF5':>12} {'Zarr':>12} {'Speedup':>10}")
-    print("-" * 61)
+    header("DataLoader throughput (samples/sec)")
     configs = set()
     for k in results:
         if "dataloader" in k and "samples_per_sec_mean" in k:
-            parts = k.split("/")
-            configs.add(parts[2])
+            configs.add(k.split("/")[2])
     for cfg in sorted(configs):
-        h = results.get(f"hdf5/dataloader/{cfg}/samples_per_sec_mean")
-        z = results.get(f"zarr/dataloader/{cfg}/samples_per_sec_mean")
-        speedup = f"{z/h:.2f}x" if (h and z) else "N/A"
-        print(f"  {cfg:<23} {h or 'N/A':>12.1f}" +
-              (f" {z:>12.1f} {speedup:>10}" if z else ""))
+        _row(cfg, get_vals(f"dataloader/{cfg}/samples_per_sec_mean"), fmt=".1f")
 
     # --- GPU Transfer ---
-    print("\n--- GPU Transfer (ms) ---")
-    for suffix in ["mean_ms", "median_ms"]:
-        h = results.get(f"hdf5/gpu_transfer/{suffix}")
-        z = results.get(f"zarr/gpu_transfer/{suffix}")
-        if h:
-            print(f"  HDF5 {suffix}: {h:.2f}")
-        if z:
-            print(f"  Zarr {suffix}: {z:.2f}")
+    header("GPU transfer (ms)")
+    for suffix in ["mean_ms", "median_ms", "p95_ms"]:
+        _row(suffix, get_vals(f"gpu_transfer/{suffix}"), fmt=".2f")
 
     # --- Training Step ---
-    print("\n--- End-to-End Training Step (ms) ---")
-    print(f"{'Metric':<30} {'HDF5':>12} {'Zarr':>12}")
-    print("-" * 56)
-    for suffix in ["total_mean_ms", "data_mean_ms", "compute_mean_ms", "data_pct"]:
-        h = results.get(f"hdf5/train_step/{suffix}")
-        z = results.get(f"zarr/train_step/{suffix}")
-        fmt = ".1f" if "pct" not in suffix else ".1f"
-        unit = "%" if "pct" in suffix else ""
-        h_str = f"{h:{fmt}}{unit}" if h else "N/A"
-        z_str = f"{z:{fmt}}{unit}" if z else "N/A"
-        print(f"  {suffix:<28} {h_str:>12} {z_str:>12}")
+    header("End-to-end training step (ms)")
+    for suffix in ["total_mean_ms", "data_mean_ms", "compute_mean_ms"]:
+        _row(suffix, get_vals(f"train_step/{suffix}"), fmt=".1f")
+    _row("data_pct (%)", get_vals("train_step/data_pct"), fmt=".1f")
 
-    print(f"\n  Peak RSS: {results.get('peak_rss_mb', 'N/A'):.0f} MB")
-    print("=" * 70)
+    print(f"\n  Peak RSS overall: {results.get('peak_rss_mb', 'N/A'):.0f} MB")
+
+    # --- Paired comparisons ---
+    print("\n--- Isolated effects ---")
+
+    def _ratio(a_key, b_key, label):
+        a = results.get(a_key)
+        b = results.get(b_key)
+        if a and b and a > 0:
+            print(f"  {label:<45} {b/a:.2f}x")
+
+    print("  (Format effect under same loading strategy)")
+    _ratio("hdf5_lazy/train_step/data_mean_ms",
+           "zarr_lazy/train_step/data_mean_ms",
+           "zarr_lazy / hdf5_lazy  (data time ratio)")
+    _ratio("hdf5_eager/train_step/data_mean_ms",
+           "zarr_eager/train_step/data_mean_ms",
+           "zarr_eager / hdf5_eager (data time ratio)")
+
+    print("  (Strategy effect under same format)")
+    _ratio("hdf5_lazy/train_step/data_mean_ms",
+           "hdf5_eager/train_step/data_mean_ms",
+           "hdf5_eager / hdf5_lazy (data time ratio)")
+    _ratio("zarr_lazy/train_step/data_mean_ms",
+           "zarr_eager/train_step/data_mean_ms",
+           "zarr_eager / zarr_lazy (data time ratio)")
+
+    print("=" * 90)
 
 
 def main():
@@ -556,6 +722,8 @@ def main():
                         help="Path to save JSON results")
     parser.add_argument("--skip_training", action="store_true",
                         help="Skip the end-to-end training benchmark (faster)")
+    parser.add_argument("--skip_eager", action="store_true",
+                        help="Skip eager cells (saves RAM for large datasets)")
     args = parser.parse_args()
 
     results = run_benchmarks(args)
