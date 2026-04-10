@@ -37,6 +37,62 @@ from numcodecs import Blosc
 
 
 # ---------------------------------------------------------------------------
+# Zarr 2.x / 3.x compatibility shim
+# ---------------------------------------------------------------------------
+
+ZARR_MAJOR = int(zarr.__version__.split(".")[0])
+
+
+def open_write_group(path):
+    """Open a Zarr group at `path` for writing, overwriting any existing data."""
+    if ZARR_MAJOR >= 3:
+        store = zarr.storage.LocalStore(path)
+        return zarr.open_group(store=store, mode="w")
+    else:
+        store = zarr.DirectoryStore(path)
+        return zarr.group(store, overwrite=True)
+
+
+def _zarr3_blosc_codec(blosc_instance):
+    """Translate a numcodecs.Blosc to a zarr 3.x BloscCodec."""
+    from zarr.codecs import BloscCodec
+    # numcodecs Blosc shuffle:  0=NOSHUFFLE, 1=SHUFFLE, 2=BITSHUFFLE
+    shuffle_map = {0: "noshuffle", 1: "shuffle", 2: "bitshuffle"}
+    shuffle_str = shuffle_map.get(blosc_instance.shuffle, "shuffle")
+    return BloscCodec(
+        cname=blosc_instance.cname,
+        clevel=blosc_instance.clevel,
+        shuffle=shuffle_str,
+    )
+
+
+def create_dataset(group, name, data, chunks, compressor):
+    """Write a numpy array into `group` under `name`, with given chunks+compressor.
+
+    Works on both zarr 2.x (compressor kwarg + Blosc instance)
+    and zarr 3.x (compressors=[BloscCodec] + create_array + arr[:] = data).
+    """
+    if ZARR_MAJOR >= 3:
+        if compressor is None:
+            compressors = []
+        else:
+            compressors = [_zarr3_blosc_codec(compressor)]
+        arr = group.create_array(
+            name=name,
+            shape=data.shape,
+            dtype=data.dtype,
+            chunks=chunks,
+            compressors=compressors,
+        )
+        arr[:] = data
+        return arr
+    else:
+        return group.create_dataset(
+            name, data=data, chunks=chunks, compressor=compressor, overwrite=True
+        )
+
+
+# ---------------------------------------------------------------------------
 # Compressor presets
 # ---------------------------------------------------------------------------
 
@@ -82,15 +138,14 @@ def get_optimal_chunks(shape, dtype, target_chunk_bytes=2e6):
 def convert_episode(hdf5_path, zarr_path, compressor):
     """Convert a single HDF5 episode to its own Zarr store."""
     with h5py.File(hdf5_path, "r") as f:
-        store = zarr.DirectoryStore(zarr_path)
-        root = zarr.group(store, overwrite=True)
+        root = open_write_group(zarr_path)
 
         action = f["/action"][()]
-        root.create_dataset("action", data=action, chunks=action.shape, compressor=compressor)
+        create_dataset(root, "action", action, action.shape, compressor)
 
         obs = root.create_group("observations")
         qpos = f["/observations/qpos"][()]
-        obs.create_dataset("qpos", data=qpos, chunks=qpos.shape, compressor=compressor)
+        create_dataset(obs, "qpos", qpos, qpos.shape, compressor)
 
         images = obs.create_group("images")
         for cam_name in ["cam_high", "cam_right_wrist", "cam_left_wrist"]:
@@ -98,7 +153,7 @@ def convert_episode(hdf5_path, zarr_path, compressor):
             if key in f:
                 img = f[key][()]  # (T, H, W, C)
                 chunks = (1,) + img.shape[1:]  # one frame per chunk for random access
-                images.create_dataset(cam_name, data=img, chunks=chunks, compressor=compressor)
+                create_dataset(images, cam_name, img, chunks, compressor)
 
     return os.path.getsize(hdf5_path)
 
@@ -172,28 +227,25 @@ def convert_merged(args, compressor):
 
     # Write merged Zarr store
     os.makedirs(args.output_dir, exist_ok=True)
-    zarr_root = zarr.group(args.output_dir, overwrite=True)
+    zarr_root = open_write_group(args.output_dir)
     zarr_data = zarr_root.create_group("data")
     zarr_meta = zarr_root.create_group("meta")
 
     # Chunk sizes: 100 along time dimension, matching DP process_data.py
     chunk_t = 100
 
-    zarr_data.create_dataset("action", data=action_arr, dtype="float32",
-                             chunks=(chunk_t, action_arr.shape[1]),
-                             compressor=compressor, overwrite=True)
-    zarr_data.create_dataset("state", data=qpos_arr, dtype="float32",
-                             chunks=(chunk_t, qpos_arr.shape[1]),
-                             compressor=compressor, overwrite=True)
+    create_dataset(zarr_data, "action", action_arr.astype(np.float32),
+                   (chunk_t, action_arr.shape[1]), compressor)
+    create_dataset(zarr_data, "state", qpos_arr,
+                   (chunk_t, qpos_arr.shape[1]), compressor)
 
     for cam_name in all_images:
         img_arr = np.concatenate(all_images[cam_name], axis=0)
         chunks = (chunk_t,) + img_arr.shape[1:]
-        zarr_data.create_dataset(cam_name, data=img_arr, chunks=chunks,
-                                 compressor=compressor, overwrite=True)
+        create_dataset(zarr_data, cam_name, img_arr, chunks, compressor)
 
-    zarr_meta.create_dataset("episode_ends", data=episode_ends_arr,
-                             dtype="int64", compressor=compressor, overwrite=True)
+    create_dataset(zarr_meta, "episode_ends", episode_ends_arr,
+                   episode_ends_arr.shape, compressor)
 
     return total_hdf5_size
 
@@ -203,6 +255,7 @@ def convert_merged(args, compressor):
 # ---------------------------------------------------------------------------
 
 def main():
+    print(f"zarr version: {zarr.__version__} (major={ZARR_MAJOR})")
     parser = argparse.ArgumentParser(description="Convert HDF5 episodes to Zarr format")
     parser.add_argument("--dataset_dir", type=str, required=True,
                         help="Directory containing episode_*.hdf5 files")

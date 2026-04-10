@@ -244,13 +244,13 @@ class ZarrEagerDataset(_EagerEpisodicDataset):
 # ---------------------------------------------------------------------------
 
 def get_norm_stats_from_hdf5(dataset_dir, num_episodes):
-    """Compute normalization stats from HDF5 episodes."""
+    """Compute normalization stats from HDF5 episodes. Returns torch tensors."""
     all_qpos, all_action = [], []
     for i in range(num_episodes):
         path = os.path.join(dataset_dir, f"episode_{i}.hdf5")
         with h5py.File(path, "r") as f:
-            all_qpos.append(torch.from_numpy(f["/observations/qpos"][()]))
-            all_action.append(torch.from_numpy(f["/action"][()]))
+            all_qpos.append(torch.from_numpy(f["/observations/qpos"][()]).float())
+            all_action.append(torch.from_numpy(f["/action"][()]).float())
 
     max_action_len = max(a.size(0) for a in all_action)
 
@@ -270,11 +270,12 @@ def get_norm_stats_from_hdf5(dataset_dir, num_episodes):
     all_qpos_t = torch.stack(padded_qpos)
     all_action_t = torch.stack(padded_action)
 
+    # Keep as torch tensors to avoid numpy<->torch mixing in __getitem__
     stats = {
-        "action_mean": all_action_t.mean(dim=[0, 1]).numpy(),
-        "action_std": all_action_t.std(dim=[0, 1]).clamp(min=1e-2).numpy(),
-        "qpos_mean": all_qpos_t.mean(dim=[0, 1]).numpy(),
-        "qpos_std": all_qpos_t.std(dim=[0, 1]).clamp(min=1e-2).numpy(),
+        "action_mean": all_action_t.mean(dim=[0, 1]),
+        "action_std": all_action_t.std(dim=[0, 1]).clamp(min=1e-2),
+        "qpos_mean": all_qpos_t.mean(dim=[0, 1]),
+        "qpos_std": all_qpos_t.std(dim=[0, 1]).clamp(min=1e-2),
     }
     return stats, max_action_len
 
