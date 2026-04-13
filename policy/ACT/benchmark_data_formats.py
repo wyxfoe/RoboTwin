@@ -1,20 +1,19 @@
 """
-Benchmark data loading for the ACT policy across a 2x2 matrix of
+Benchmark data loading for the ACT policy across a 3x2 matrix of
 (file format) x (loading strategy) to decouple the two variables:
 
-                          HDF5                     Zarr
-    Lazy (on-disk)    HDF5-lazy               Zarr-lazy
-    Eager (preload)   HDF5-eager              Zarr-eager
+                          HDF5                 Zarr                LeRobot v2.1
+    Lazy (on-disk)    HDF5-lazy           Zarr-lazy           LeRobot-lazy
+    Eager (preload)   HDF5-eager          Zarr-eager          LeRobot-eager
 
-    - Lazy   = open the file and read the timestep inside __getitem__
-               (what ACT currently does)
+    - Lazy   = open the file/store and read the timestep inside __getitem__
+               (what ACT currently does for HDF5; LeRobot's default mode)
     - Eager  = load all episodes once in __init__ into numpy arrays,
                then slice from RAM inside __getitem__
                (what DP does via ReplayBuffer.copy_from_path)
 
-Comparing (HDF5-lazy, Zarr-lazy) vs (HDF5-eager, Zarr-eager) isolates the
-format effect. Comparing (HDF5-lazy, HDF5-eager) vs (Zarr-lazy, Zarr-eager)
-isolates the loading strategy effect.
+Comparing rows isolates the storage-format effect under a fixed strategy;
+comparing columns isolates the loading strategy effect under a fixed format.
 
 Measures per cell:
   1. Raw I/O latency  — single-item __getitem__ speed
@@ -27,10 +26,14 @@ Usage:
     python benchmark_data_formats.py \
         --hdf5_dir <path_to_hdf5_episodes> \
         --zarr_dir <path_to_zarr_episodes> \
+        --lerobot_repo_id <repo_id> [--lerobot_root <root>] \
         --num_episodes 50 \
         --batch_size 8 \
         --num_warmup 5 \
         --num_iters 50
+
+Any of --zarr_dir / --lerobot_repo_id may be omitted; the corresponding cells
+are skipped automatically. LeRobot cells require the `lerobot` package.
 
 Output: structured report printed to stdout and saved as benchmark_results.json.
 """
@@ -54,6 +57,13 @@ try:
 except ImportError:
     zarr = None
     print("Warning: zarr not installed. Zarr benchmarks will be skipped.")
+
+try:
+    from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+    _LEROBOT_IMPORT_ERR = None
+except Exception as _exc:
+    LeRobotDataset = None
+    _LEROBOT_IMPORT_ERR = _exc
 
 # ---------------------------------------------------------------------------
 # Dataset implementations
@@ -237,6 +247,167 @@ class ZarrEagerDataset(_EagerEpisodicDataset):
                 },
             }
             self.episodes.append(ep)
+
+
+# ---------------------------------------------------------------------------
+# LeRobot v2.1 datasets
+# ---------------------------------------------------------------------------
+#
+# LeRobotDataset wraps parquet (state/action + indices) and either MP4 videos
+# (use_videos=True) or PNG image folders (use_videos=False). Its __getitem__
+# returns a dict keyed by feature name; images arrive as float32 CHW tensors
+# already in [0, 1]. We adapt that to ACT's (image_data, qpos, action, is_pad)
+# tuple so the benchmark is apples-to-apples.
+
+
+def _make_lerobot_dataset(repo_id, root):
+    """Instantiate a read-only LeRobotDataset (no HF Hub calls)."""
+    if LeRobotDataset is None:
+        raise RuntimeError(
+            f"lerobot is not installed: {_LEROBOT_IMPORT_ERR}. "
+            f"Install with `pip install lerobot`."
+        )
+    kwargs = {"repo_id": repo_id}
+    if root is not None:
+        kwargs["root"] = root
+    # local_files_only avoids an implicit hub fetch.
+    try:
+        return LeRobotDataset(local_files_only=True, **kwargs)
+    except TypeError:
+        # older lerobot API
+        return LeRobotDataset(**kwargs)
+
+
+def _lerobot_episode_bounds(ds):
+    """Return list[(from_idx, to_idx)] for each episode."""
+    idx = ds.episode_data_index
+    froms = idx["from"].tolist() if hasattr(idx["from"], "tolist") else list(idx["from"])
+    tos = idx["to"].tolist() if hasattr(idx["to"], "tolist") else list(idx["to"])
+    return list(zip(froms, tos))
+
+
+def _lerobot_image_to_hwc_uint8(img_tensor):
+    """Convert a LeRobot image tensor (CHW float[0,1] or HWC uint8) to HWC uint8."""
+    if img_tensor.dtype == torch.uint8:
+        if img_tensor.ndim == 3 and img_tensor.shape[0] in (1, 3):
+            img_tensor = img_tensor.permute(1, 2, 0)
+        return img_tensor.numpy()
+    # float CHW in [0,1]
+    arr = img_tensor.detach().cpu().numpy()
+    if arr.ndim == 3 and arr.shape[0] in (1, 3):
+        arr = np.transpose(arr, (1, 2, 0))
+    arr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
+    return arr
+
+
+class LeRobotLazyDataset(torch.utils.data.Dataset):
+    """LeRobot v2.1 + lazy: open parquet once, decode video frames on demand.
+
+    Each __getitem__ pulls a single-frame sample for observation state/images
+    (triggering a video seek+decode when use_videos=True) and a slice of the
+    parquet action column for the action chunk.
+    """
+
+    def __init__(self, episode_ids, repo_id, root, camera_names, norm_stats, max_action_len):
+        self.ds = _make_lerobot_dataset(repo_id, root)
+        self.episode_bounds = _lerobot_episode_bounds(self.ds)
+        self.episode_ids = episode_ids
+        self.camera_names = camera_names
+        self.norm_stats = norm_stats
+        self.max_action_len = max_action_len
+        # hf_dataset is an Arrow-backed table; fast for raw column slicing.
+        self._hf = self.ds.hf_dataset
+
+    def __len__(self):
+        return len(self.episode_ids)
+
+    def __getitem__(self, index):
+        ep_id = self.episode_ids[index]
+        from_i, to_i = self.episode_bounds[ep_id]
+        episode_len = to_i - from_i
+        start_ts = np.random.randint(0, episode_len)
+        global_idx = from_i + start_ts
+
+        # Single-frame sample: triggers image decode + state read
+        sample = self.ds[global_idx]
+        qpos = sample["observation.state"]
+        if isinstance(qpos, torch.Tensor):
+            qpos_np = qpos.detach().cpu().numpy().astype(np.float32)
+        else:
+            qpos_np = np.asarray(qpos, dtype=np.float32)
+
+        image_list = []
+        for cam in self.camera_names:
+            img = sample[f"observation.images.{cam}"]
+            image_list.append(_lerobot_image_to_hwc_uint8(img))
+        all_cam_images = np.stack(image_list, axis=0)
+
+        # Action chunk from parquet (no video decode needed)
+        action_rows = self._hf.select(range(global_idx, to_i))["action"]
+        action = np.asarray(action_rows, dtype=np.float32)
+        action_len = action.shape[0]
+
+        padded_action = np.zeros((self.max_action_len, action.shape[1]), dtype=np.float32)
+        padded_action[:action_len] = action
+        is_pad = np.ones(self.max_action_len, dtype=bool)
+        is_pad[:action_len] = False
+
+        image_data = torch.from_numpy(all_cam_images)
+        qpos_data = torch.from_numpy(qpos_np).float()
+        action_data = torch.from_numpy(padded_action).float()
+        is_pad_t = torch.from_numpy(is_pad).bool()
+
+        image_data = torch.einsum("k h w c -> k c h w", image_data)
+        image_data = image_data / 255.0
+        action_data = (action_data - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
+        qpos_data = (qpos_data - self.norm_stats["qpos_mean"]) / self.norm_stats["qpos_std"]
+
+        return image_data, qpos_data, action_data, is_pad_t
+
+
+class LeRobotEagerDataset(_EagerEpisodicDataset):
+    """LeRobot v2.1 + eager: decode every episode once at __init__.
+
+    For the video backend this is the expensive path — every frame is decoded
+    up front. After that, __getitem__ is identical to HDF5-eager / Zarr-eager.
+    """
+
+    def __init__(self, episode_ids, repo_id, root, camera_names, norm_stats, max_action_len):
+        super().__init__(camera_names, norm_stats, max_action_len)
+        ds = _make_lerobot_dataset(repo_id, root)
+        bounds = _lerobot_episode_bounds(ds)
+        hf = ds.hf_dataset
+
+        for ep_id in episode_ids:
+            from_i, to_i = bounds[ep_id]
+            T = to_i - from_i
+            # Fast-path: state + action are plain parquet columns.
+            state_rows = hf.select(range(from_i, to_i))["observation.state"]
+            action_rows = hf.select(range(from_i, to_i))["action"]
+            qpos = np.asarray(state_rows, dtype=np.float32)
+            action = np.asarray(action_rows, dtype=np.float32)
+
+            # Images must go through the dataset so videos are decoded.
+            # We pre-allocate per-camera arrays and fill frame by frame.
+            first_sample = ds[from_i]
+            imgs_hwc = {}
+            for cam in camera_names:
+                h, w, _ = _lerobot_image_to_hwc_uint8(
+                    first_sample[f"observation.images.{cam}"]
+                ).shape
+                imgs_hwc[cam] = np.zeros((T, h, w, 3), dtype=np.uint8)
+            for i in range(T):
+                s = ds[from_i + i]
+                for cam in camera_names:
+                    imgs_hwc[cam][i] = _lerobot_image_to_hwc_uint8(
+                        s[f"observation.images.{cam}"]
+                    )
+
+            self.episodes.append({
+                "action": action,
+                "qpos": qpos,
+                "images": imgs_hwc,
+            })
 
 
 # ---------------------------------------------------------------------------
@@ -514,7 +685,7 @@ def benchmark_training_step(dataset, batch_size, num_warmup, num_iters, label, c
 # ---------------------------------------------------------------------------
 
 def _build_dataset(cell, episode_ids, args, camera_names, norm_stats, max_action_len):
-    """Instantiate one of the four cells and return (dataset, init_seconds)."""
+    """Instantiate one of the six cells and return (dataset, init_seconds)."""
     t0 = time.perf_counter()
     if cell == "hdf5_lazy":
         ds = HDF5LazyDataset(episode_ids, args.hdf5_dir, camera_names, norm_stats, max_action_len)
@@ -524,6 +695,12 @@ def _build_dataset(cell, episode_ids, args, camera_names, norm_stats, max_action
         ds = ZarrLazyDataset(episode_ids, args.zarr_dir, camera_names, norm_stats, max_action_len)
     elif cell == "zarr_eager":
         ds = ZarrEagerDataset(episode_ids, args.zarr_dir, camera_names, norm_stats, max_action_len)
+    elif cell == "lerobot_lazy":
+        ds = LeRobotLazyDataset(episode_ids, args.lerobot_repo_id, args.lerobot_root,
+                                camera_names, norm_stats, max_action_len)
+    elif cell == "lerobot_eager":
+        ds = LeRobotEagerDataset(episode_ids, args.lerobot_repo_id, args.lerobot_root,
+                                 camera_names, norm_stats, max_action_len)
     else:
         raise ValueError(cell)
     return ds, time.perf_counter() - t0
@@ -531,7 +708,7 @@ def _build_dataset(cell, episode_ids, args, camera_names, norm_stats, max_action
 
 def run_benchmarks(args):
     print("=" * 70)
-    print("  2x2 Benchmark: (HDF5 vs Zarr) x (Lazy vs Eager)")
+    print("  3x2 Benchmark: (HDF5 vs Zarr vs LeRobot v2.1) x (Lazy vs Eager)")
     print("=" * 70)
 
     camera_names = ["cam_high", "cam_right_wrist", "cam_left_wrist"]
@@ -545,11 +722,17 @@ def run_benchmarks(args):
     zarr_ok = zarr is not None and args.zarr_dir and os.path.isdir(args.zarr_dir)
     if not zarr_ok:
         print(f"  Zarr unavailable (zarr_dir={args.zarr_dir}); skipping Zarr cells.")
+    lerobot_ok = LeRobotDataset is not None and bool(args.lerobot_repo_id)
+    if not lerobot_ok:
+        reason = _LEROBOT_IMPORT_ERR if LeRobotDataset is None else "no --lerobot_repo_id"
+        print(f"  LeRobot unavailable ({reason}); skipping LeRobot cells.")
 
-    # 2x2 matrix of cells to test
+    # 3x2 matrix of cells to test
     cells = ["hdf5_lazy", "hdf5_eager"]
     if zarr_ok:
         cells += ["zarr_lazy", "zarr_eager"]
+    if lerobot_ok:
+        cells += ["lerobot_lazy", "lerobot_eager"]
 
     all_results = {}
 
@@ -605,11 +788,16 @@ def run_benchmarks(args):
 
 
 CELL_LABELS = {
-    "hdf5_lazy":  "HDF5 lazy",
-    "hdf5_eager": "HDF5 eager",
-    "zarr_lazy":  "Zarr lazy",
-    "zarr_eager": "Zarr eager",
+    "hdf5_lazy":     "HDF5 lazy",
+    "hdf5_eager":    "HDF5 eager",
+    "zarr_lazy":     "Zarr lazy",
+    "zarr_eager":    "Zarr eager",
+    "lerobot_lazy":  "LeRobot lazy",
+    "lerobot_eager": "LeRobot eager",
 }
+
+CELL_ORDER = ["hdf5_lazy", "hdf5_eager", "zarr_lazy", "zarr_eager",
+              "lerobot_lazy", "lerobot_eager"]
 
 
 def _row(name, values, fmt=".2f", width=12):
@@ -630,8 +818,7 @@ def print_report(results):
                           HDF5 lazy   HDF5 eager  Zarr lazy   Zarr eager
         metric_name          ...         ...         ...         ...
     """
-    cells = [c for c in ["hdf5_lazy", "hdf5_eager", "zarr_lazy", "zarr_eager"]
-             if any(k.startswith(c + "/") for k in results)]
+    cells = [c for c in CELL_ORDER if any(k.startswith(c + "/") for k in results)]
     labels = [CELL_LABELS[c] for c in cells]
 
     def header(title):
@@ -642,9 +829,9 @@ def print_report(results):
     def get_vals(key_suffix):
         return [results.get(f"{c}/{key_suffix}") for c in cells]
 
-    print("\n" + "=" * 90)
-    print("  2x2 BENCHMARK RESULTS  (rows = metric, columns = cell)")
-    print("=" * 90)
+    print("\n" + "=" * 95)
+    print("  3x2 BENCHMARK RESULTS  (rows = metric, columns = cell)")
+    print("=" * 95)
 
     # --- Init time & RSS ---
     header("Dataset init")
@@ -687,23 +874,32 @@ def print_report(results):
         if a and b and a > 0:
             print(f"  {label:<45} {b/a:.2f}x")
 
-    print("  (Format effect under same loading strategy)")
+    print("  (Format effect under same loading strategy, HDF5 = baseline)")
     _ratio("hdf5_lazy/train_step/data_mean_ms",
            "zarr_lazy/train_step/data_mean_ms",
-           "zarr_lazy / hdf5_lazy  (data time ratio)")
+           "zarr_lazy     / hdf5_lazy  (data time ratio)")
+    _ratio("hdf5_lazy/train_step/data_mean_ms",
+           "lerobot_lazy/train_step/data_mean_ms",
+           "lerobot_lazy  / hdf5_lazy  (data time ratio)")
     _ratio("hdf5_eager/train_step/data_mean_ms",
            "zarr_eager/train_step/data_mean_ms",
-           "zarr_eager / hdf5_eager (data time ratio)")
+           "zarr_eager    / hdf5_eager (data time ratio)")
+    _ratio("hdf5_eager/train_step/data_mean_ms",
+           "lerobot_eager/train_step/data_mean_ms",
+           "lerobot_eager / hdf5_eager (data time ratio)")
 
-    print("  (Strategy effect under same format)")
+    print("  (Strategy effect under same format, lazy = baseline)")
     _ratio("hdf5_lazy/train_step/data_mean_ms",
            "hdf5_eager/train_step/data_mean_ms",
-           "hdf5_eager / hdf5_lazy (data time ratio)")
+           "hdf5_eager    / hdf5_lazy    (data time ratio)")
     _ratio("zarr_lazy/train_step/data_mean_ms",
            "zarr_eager/train_step/data_mean_ms",
-           "zarr_eager / zarr_lazy (data time ratio)")
+           "zarr_eager    / zarr_lazy    (data time ratio)")
+    _ratio("lerobot_lazy/train_step/data_mean_ms",
+           "lerobot_eager/train_step/data_mean_ms",
+           "lerobot_eager / lerobot_lazy (data time ratio)")
 
-    print("=" * 90)
+    print("=" * 95)
 
 
 def main():
@@ -712,6 +908,10 @@ def main():
                         help="Directory containing episode_*.hdf5 files")
     parser.add_argument("--zarr_dir", type=str, default=None,
                         help="Directory containing episode_*.zarr stores")
+    parser.add_argument("--lerobot_repo_id", type=str, default=None,
+                        help="LeRobot v2.1 repo_id (omit to skip LeRobot cells)")
+    parser.add_argument("--lerobot_root", type=str, default=None,
+                        help="Root dir for LeRobot data (defaults to HF_LEROBOT_HOME)")
     parser.add_argument("--num_episodes", type=int, required=True,
                         help="Number of episodes to use")
     parser.add_argument("--batch_size", type=int, default=8)

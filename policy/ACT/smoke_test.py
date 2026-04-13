@@ -73,8 +73,18 @@ def main():
         print(f"Install with: pip install {' '.join(missing)}")
         sys.exit(1)
 
+    # LeRobot is optional for the smoke test; we probe for it.
+    lerobot_available = True
+    try:
+        import lerobot  # noqa: F401
+    except Exception as exc:
+        lerobot_available = False
+        print(f"[info] lerobot not installed ({exc!s}); LeRobot cells will be skipped.")
+
     hdf5_dir = os.path.join(args.work_dir, "hdf5")
     zarr_dir = os.path.join(args.work_dir, "zarr")
+    lerobot_root = os.path.join(args.work_dir, "lerobot")
+    lerobot_repo_id = "robotwin/smoke_test"
 
     if os.path.exists(args.work_dir):
         shutil.rmtree(args.work_dir)
@@ -105,9 +115,27 @@ def main():
         print("Conversion failed.")
         sys.exit(ret.returncode)
 
+    # -------- Step 2b: convert to LeRobot v2.1 (optional) --------
+    if lerobot_available:
+        convert_lerobot = os.path.join(script_dir, "convert_hdf5_to_lerobot.py")
+        print(f"\n[2b/3] Converting HDF5 -> LeRobot v2.1 (mode=image for smoke speed)")
+        cmd = [
+            sys.executable, convert_lerobot,
+            "--dataset_dir", hdf5_dir,
+            "--repo_id", lerobot_repo_id,
+            "--num_episodes", str(args.num_episodes),
+            "--mode", "image",         # avoid pyav dep on CI
+            "--fps", "25",
+            "--root", lerobot_root,
+        ]
+        ret = subprocess.run(cmd, check=False)
+        if ret.returncode != 0:
+            print("LeRobot conversion failed; continuing without LeRobot cells.")
+            lerobot_available = False
+
     # -------- Step 3: run benchmark --------
     bench_script = os.path.join(script_dir, "benchmark_data_formats.py")
-    print(f"\n[3/3] Running 2x2 benchmark")
+    print(f"\n[3/3] Running 3x2 benchmark")
     cmd = [
         sys.executable, bench_script,
         "--hdf5_dir", hdf5_dir,
@@ -118,6 +146,11 @@ def main():
         "--num_iters", str(args.num_iters),
         "--output", os.path.join(args.work_dir, "results.json"),
     ]
+    if lerobot_available:
+        cmd += [
+            "--lerobot_repo_id", lerobot_repo_id,
+            "--lerobot_root", lerobot_root,
+        ]
     if args.skip_training:
         cmd.append("--skip_training")
     ret = subprocess.run(cmd, check=False)
