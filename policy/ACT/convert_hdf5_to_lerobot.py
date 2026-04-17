@@ -38,7 +38,8 @@ import numpy as np
 DEFAULT_CAMERAS = ["cam_high", "cam_right_wrist", "cam_left_wrist"]
 
 
-def _build_features(state_dim, action_dim, cameras, img_hw, mode):
+def _build_features(state_dim, action_dim, cameras, img_hw, mode,
+                     depth_cameras=(), seg_cameras=()):
     """Return the LeRobot `features` dict describing every column we'll write."""
     feats = {
         "observation.state": {
@@ -59,17 +60,33 @@ def _build_features(state_dim, action_dim, cameras, img_hw, mode):
             "shape": (3, h, w),
             "names": ["channels", "height", "width"],
         }
+    # Depth: float32 parquet column (NOT video — MP4 quantizes depth to garbage)
+    for cam in depth_cameras:
+        feats[f"observation.depths.{cam}"] = {
+            "dtype": "float32",
+            "shape": (h, w),
+            "names": ["height", "width"],
+        }
+    # Segmentation: store as "image" (PNG) — lossless and cheap to decode
+    for cam in seg_cameras:
+        feats[f"observation.segmentation.{cam}"] = {
+            "dtype": "image",
+            "shape": (3, h, w),
+            "names": ["channels", "height", "width"],
+        }
     return feats
 
 
 def _peek_shapes(hdf5_path, cameras):
-    """Return (state_dim, action_dim, (H, W)) from the first episode."""
+    """Return (state_dim, action_dim, (H, W), depth_cameras, seg_cameras)."""
     with h5py.File(hdf5_path, "r") as f:
         state_dim = f["/observations/qpos"].shape[1]
         action_dim = f["/action"].shape[1]
         first_cam = cameras[0]
         h, w = f[f"/observations/images/{first_cam}"].shape[1:3]
-    return state_dim, action_dim, (h, w)
+        depth_cameras = list(f["/observations/depths"].keys()) if "depths" in f["/observations"] else []
+        seg_cameras = list(f["/observations/segmentation"].keys()) if "segmentation" in f["/observations"] else []
+    return state_dim, action_dim, (h, w), depth_cameras, seg_cameras
 
 
 def convert(args):
@@ -87,8 +104,13 @@ def convert(args):
     first_path = os.path.join(args.dataset_dir, f"episode_0.hdf5")
     if not os.path.exists(first_path):
         raise FileNotFoundError(first_path)
-    state_dim, action_dim, img_hw = _peek_shapes(first_path, cameras)
-    features = _build_features(state_dim, action_dim, cameras, img_hw, args.mode)
+    state_dim, action_dim, img_hw, depth_cameras, seg_cameras = _peek_shapes(first_path, cameras)
+    if depth_cameras:
+        print(f"  [enriched] depth cameras: {depth_cameras}")
+    if seg_cameras:
+        print(f"  [enriched] segmentation cameras: {seg_cameras}")
+    features = _build_features(state_dim, action_dim, cameras, img_hw, args.mode,
+                               depth_cameras, seg_cameras)
 
     # Resolve output directory.
     root = Path(args.root) if args.root else HF_LEROBOT_HOME
@@ -123,6 +145,14 @@ def convert(args):
             state = f["/observations/qpos"][()].astype(np.float32)
             action = f["/action"][()].astype(np.float32)
             imgs = {cam: f[f"/observations/images/{cam}"][()] for cam in cameras}
+            depths = {}
+            if depth_cameras:
+                for dc in depth_cameras:
+                    depths[dc] = f[f"/observations/depths/{dc}"][()].astype(np.float32)
+            segs = {}
+            if seg_cameras:
+                for sc in seg_cameras:
+                    segs[sc] = f[f"/observations/segmentation/{sc}"][()]
             T = state.shape[0]
 
         for t in range(T):
@@ -131,11 +161,17 @@ def convert(args):
                 "action": action[t],
             }
             for cam in cameras:
-                # LeRobot expects HWC uint8 for both video and image modes.
                 img = imgs[cam][t]
                 if img.dtype != np.uint8:
                     img = img.astype(np.uint8)
                 frame[f"observation.images.{cam}"] = img
+            for dc in depth_cameras:
+                frame[f"observation.depths.{dc}"] = depths[dc][t]
+            for sc in seg_cameras:
+                seg_frame = segs[sc][t]
+                if seg_frame.dtype != np.uint8:
+                    seg_frame = seg_frame.astype(np.uint8)
+                frame[f"observation.segmentation.{sc}"] = seg_frame
             dataset.add_frame(frame, task=args.task)
         dataset.save_episode()
         print(f"  converted episode {ep_id} ({T} steps)")

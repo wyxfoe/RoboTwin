@@ -136,7 +136,11 @@ def get_optimal_chunks(shape, dtype, target_chunk_bytes=2e6):
 # ---------------------------------------------------------------------------
 
 def convert_episode(hdf5_path, zarr_path, compressor):
-    """Convert a single HDF5 episode to its own Zarr store."""
+    """Convert a single HDF5 episode to its own Zarr store.
+
+    Auto-discovers all observation groups (images, depths, segmentation, etc.)
+    so both clean and enriched datasets work without code changes.
+    """
     with h5py.File(hdf5_path, "r") as f:
         root = open_write_group(zarr_path)
 
@@ -147,13 +151,23 @@ def convert_episode(hdf5_path, zarr_path, compressor):
         qpos = f["/observations/qpos"][()]
         create_dataset(obs, "qpos", qpos, qpos.shape, compressor)
 
-        images = obs.create_group("images")
-        for cam_name in ["cam_high", "cam_right_wrist", "cam_left_wrist"]:
-            key = f"/observations/images/{cam_name}"
-            if key in f:
-                img = f[key][()]  # (T, H, W, C)
-                chunks = (1,) + img.shape[1:]  # one frame per chunk for random access
-                create_dataset(images, cam_name, img, chunks, compressor)
+        # Auto-discover observation sub-groups (images, depths, segmentation, …)
+        for obs_group_name in f["/observations"].keys():
+            if obs_group_name == "qpos":
+                continue
+            src = f[f"/observations/{obs_group_name}"]
+            if isinstance(src, h5py.Group):
+                zarr_grp = obs.create_group(obs_group_name)
+                for key in src.keys():
+                    arr = src[key][()]
+                    if arr.ndim >= 3 and arr.shape[0] > 1:
+                        chunks = (1,) + arr.shape[1:]
+                    else:
+                        chunks = arr.shape
+                    create_dataset(zarr_grp, key, arr, chunks, compressor)
+            elif isinstance(src, h5py.Dataset):
+                arr = src[()]
+                create_dataset(obs, obs_group_name, arr, arr.shape, compressor)
 
     return os.path.getsize(hdf5_path)
 

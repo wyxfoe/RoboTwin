@@ -30,7 +30,19 @@ def load_hdf5(dataset_path):
         for cam_name in root[f"/observation/"].keys():
             image_dict[cam_name] = root[f"/observation/{cam_name}/rgb"][()]
 
-    return left_gripper, left_arm, right_gripper, right_arm, image_dict
+        # Enriched modalities (optional)
+        depth_dict = {}
+        seg_dict = {}
+        for cam_name in root["/observation/"].keys():
+            cam_grp = root[f"/observation/{cam_name}"]
+            if "depth" in cam_grp:
+                depth_dict[cam_name] = cam_grp["depth"][()]
+            if "mesh_segmentation" in cam_grp:
+                seg_dict[cam_name] = cam_grp["mesh_segmentation"][()]
+            elif "actor_segmentation" in cam_grp:
+                seg_dict[cam_name] = cam_grp["actor_segmentation"][()]
+
+    return left_gripper, left_arm, right_gripper, right_arm, image_dict, depth_dict, seg_dict
 
 
 def images_encoding(imgs):
@@ -48,6 +60,13 @@ def images_encoding(imgs):
     return encode_data, max_len
 
 
+CAM_NAME_MAP = {
+    "head_camera": "cam_high",
+    "right_camera": "cam_right_wrist",
+    "left_camera": "cam_left_wrist",
+}
+
+
 def data_transform(path, episode_num, save_path):
     begin = 0
     floders = os.listdir(path)
@@ -56,9 +75,22 @@ def data_transform(path, episode_num, save_path):
     if not os.path.exists(save_path):
         os.makedirs(save_path)
 
+    has_depth = None
+    has_seg = None
+
     for i in range(episode_num):
-        left_gripper_all, left_arm_all, right_gripper_all, right_arm_all, image_dict = (load_hdf5(
-            os.path.join(path, f"episode{i}.hdf5")))
+        (left_gripper_all, left_arm_all, right_gripper_all, right_arm_all,
+         image_dict, depth_dict, seg_dict) = load_hdf5(
+            os.path.join(path, f"episode{i}.hdf5"))
+
+        if has_depth is None:
+            has_depth = len(depth_dict) > 0
+            has_seg = len(seg_dict) > 0
+            if has_depth:
+                print(f"  [enriched] depth modality detected for cameras: {list(depth_dict.keys())}")
+            if has_seg:
+                print(f"  [enriched] segmentation modality detected for cameras: {list(seg_dict.keys())}")
+
         qpos = []
         actions = []
         cam_high = []
@@ -66,6 +98,9 @@ def data_transform(path, episode_num, save_path):
         cam_left_wrist = []
         left_arm_dim = []
         right_arm_dim = []
+
+        depth_arrays = {CAM_NAME_MAP[c]: [] for c in depth_dict} if has_depth else {}
+        seg_arrays = {CAM_NAME_MAP[c]: [] for c in seg_dict} if has_seg else {}
 
         last_state = None
         for j in range(0, left_gripper_all.shape[0]):
@@ -98,6 +133,22 @@ def data_transform(path, episode_num, save_path):
                 camera_left_wrist_resized = cv2.resize(camera_left_wrist, (640, 480))
                 cam_left_wrist.append(camera_left_wrist_resized)
 
+                # Enriched: depth
+                if has_depth:
+                    for raw_cam, act_cam in CAM_NAME_MAP.items():
+                        if raw_cam in depth_dict:
+                            d = depth_dict[raw_cam][j]  # (H, W) float64
+                            d_resized = cv2.resize(d, (640, 480), interpolation=cv2.INTER_NEAREST)
+                            depth_arrays[act_cam].append(d_resized.astype(np.float32))
+
+                # Enriched: segmentation
+                if has_seg:
+                    for raw_cam, act_cam in CAM_NAME_MAP.items():
+                        if raw_cam in seg_dict:
+                            s = seg_dict[raw_cam][j]  # (H, W, 3) uint8
+                            s_resized = cv2.resize(s, (640, 480), interpolation=cv2.INTER_NEAREST)
+                            seg_arrays[act_cam].append(s_resized)
+
             if j != 0:
                 action = state
                 actions.append(action)
@@ -113,12 +164,20 @@ def data_transform(path, episode_num, save_path):
             obs.create_dataset("left_arm_dim", data=np.array(left_arm_dim))
             obs.create_dataset("right_arm_dim", data=np.array(right_arm_dim))
             image = obs.create_group("images")
-            # cam_high_enc, len_high = images_encoding(cam_high)
-            # cam_right_wrist_enc, len_right = images_encoding(cam_right_wrist)
-            # cam_left_wrist_enc, len_left = images_encoding(cam_left_wrist)
             image.create_dataset("cam_high", data=np.stack(cam_high), dtype=np.uint8)
             image.create_dataset("cam_right_wrist", data=np.stack(cam_right_wrist), dtype=np.uint8)
             image.create_dataset("cam_left_wrist", data=np.stack(cam_left_wrist), dtype=np.uint8)
+
+            # Enriched modalities
+            if has_depth:
+                depths_grp = obs.create_group("depths")
+                for cam_name, arr_list in depth_arrays.items():
+                    depths_grp.create_dataset(cam_name, data=np.stack(arr_list), dtype=np.float32)
+
+            if has_seg:
+                seg_grp = obs.create_group("segmentation")
+                for cam_name, arr_list in seg_arrays.items():
+                    seg_grp.create_dataset(cam_name, data=np.stack(arr_list), dtype=np.uint8)
 
         begin += 1
         print(f"proccess {i} success!")

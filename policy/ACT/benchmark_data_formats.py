@@ -66,12 +66,29 @@ except Exception as _exc:
     _LEROBOT_IMPORT_ERR = _exc
 
 # ---------------------------------------------------------------------------
+# Helper: discover enriched modalities from an HDF5 episode
+# ---------------------------------------------------------------------------
+
+def discover_enriched_keys(hdf5_path):
+    """Return (depth_cameras, seg_cameras) present in an episode."""
+    with h5py.File(hdf5_path, "r") as f:
+        obs = f["/observations"]
+        depth_cams = list(obs["depths"].keys()) if "depths" in obs else []
+        seg_cams = list(obs["segmentation"].keys()) if "segmentation" in obs else []
+    return depth_cams, seg_cams
+
+
+# ---------------------------------------------------------------------------
 # Dataset implementations
 # ---------------------------------------------------------------------------
 
 class HDF5LazyDataset(torch.utils.data.Dataset):
     """HDF5 + lazy: open the file and read one timestep inside __getitem__.
-    Mirrors the original ACT utils.py behavior."""
+    Mirrors the original ACT utils.py behavior.
+
+    When enriched modalities (depths, segmentation) are present, they are also
+    read from disk so the I/O timing reflects the full load cost.
+    """
 
     def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, max_action_len):
         self.episode_ids = episode_ids
@@ -79,6 +96,9 @@ class HDF5LazyDataset(torch.utils.data.Dataset):
         self.camera_names = camera_names
         self.norm_stats = norm_stats
         self.max_action_len = max_action_len
+        # Probe first episode for enriched modalities
+        first = os.path.join(dataset_dir, f"episode_{episode_ids[0]}.hdf5")
+        self.depth_cams, self.seg_cams = discover_enriched_keys(first)
 
     def __len__(self):
         return len(self.episode_ids)
@@ -95,6 +115,11 @@ class HDF5LazyDataset(torch.utils.data.Dataset):
                 image_dict[cam_name] = root[f"/observations/images/{cam_name}"][start_ts]
             action = root["/action"][start_ts:]
             action_len = episode_len - start_ts
+            # Read enriched modalities (measures true I/O cost)
+            for dc in self.depth_cams:
+                _ = root[f"/observations/depths/{dc}"][start_ts]
+            for sc in self.seg_cams:
+                _ = root[f"/observations/segmentation/{sc}"][start_ts]
 
         padded_action = np.zeros((self.max_action_len, action.shape[1]), dtype=np.float32)
         padded_action[:action_len] = action
@@ -124,6 +149,10 @@ class ZarrLazyDataset(torch.utils.data.Dataset):
         self.camera_names = camera_names
         self.norm_stats = norm_stats
         self.max_action_len = max_action_len
+        # Probe first episode for enriched modalities
+        first = zarr.open(os.path.join(dataset_dir, f"episode_{episode_ids[0]}.zarr"), mode="r")
+        self.depth_cams = list(first["observations/depths"].keys()) if "depths" in first["observations"] else []
+        self.seg_cams = list(first["observations/segmentation"].keys()) if "segmentation" in first["observations"] else []
 
     def __len__(self):
         return len(self.episode_ids)
@@ -141,6 +170,10 @@ class ZarrLazyDataset(torch.utils.data.Dataset):
             image_dict[cam_name] = root[f"observations/images/{cam_name}"][start_ts]
         action = root["action"][start_ts:]
         action_len = episode_len - start_ts
+        for dc in self.depth_cams:
+            _ = root[f"observations/depths/{dc}"][start_ts]
+        for sc in self.seg_cams:
+            _ = root[f"observations/segmentation/{sc}"][start_ts]
 
         padded_action = np.zeros((self.max_action_len, action.shape[1]), dtype=np.float32)
         padded_action[:action_len] = action
@@ -226,6 +259,11 @@ class HDF5EagerDataset(_EagerEpisodicDataset):
                         cam: f[f"/observations/images/{cam}"][()] for cam in camera_names
                     },
                 }
+                # Also preload enriched modalities so init time + RSS reflect full cost
+                if "depths" in f["/observations"]:
+                    ep["depths"] = {c: f[f"/observations/depths/{c}"][()] for c in f["/observations/depths"]}
+                if "segmentation" in f["/observations"]:
+                    ep["segs"] = {c: f[f"/observations/segmentation/{c}"][()] for c in f["/observations/segmentation"]}
             self.episodes.append(ep)
 
 
@@ -246,6 +284,10 @@ class ZarrEagerDataset(_EagerEpisodicDataset):
                     cam: root[f"observations/images/{cam}"][:] for cam in camera_names
                 },
             }
+            if "depths" in root["observations"]:
+                ep["depths"] = {c: root[f"observations/depths/{c}"][:] for c in root["observations/depths"]}
+            if "segmentation" in root["observations"]:
+                ep["segs"] = {c: root[f"observations/segmentation/{c}"][:] for c in root["observations/segmentation"]}
             self.episodes.append(ep)
 
 
@@ -902,6 +944,78 @@ def print_report(results):
     print("=" * 95)
 
 
+# ---------------------------------------------------------------------------
+# Per-key storage breakdown
+# ---------------------------------------------------------------------------
+
+def storage_breakdown_hdf5(hdf5_dir, num_episodes):
+    """Analyze per-feature storage costs in HDF5 episodes."""
+    key_sizes = {}  # key -> total bytes
+    for i in range(num_episodes):
+        path = os.path.join(hdf5_dir, f"episode_{i}.hdf5")
+        if not os.path.exists(path):
+            continue
+        with h5py.File(path, "r") as f:
+            def _walk(grp, prefix=""):
+                for name in grp:
+                    full = f"{prefix}/{name}" if prefix else name
+                    item = grp[name]
+                    if isinstance(item, h5py.Dataset):
+                        nbytes = item.id.get_storage_size()
+                        key_sizes[full] = key_sizes.get(full, 0) + nbytes
+                    elif isinstance(item, h5py.Group):
+                        _walk(item, full)
+            _walk(f)
+    return key_sizes
+
+
+def storage_breakdown_zarr(zarr_dir, num_episodes):
+    """Analyze per-array storage costs in Zarr episodes."""
+    key_sizes = {}
+    for i in range(num_episodes):
+        path = os.path.join(zarr_dir, f"episode_{i}.zarr")
+        if not os.path.isdir(path):
+            continue
+        root = zarr.open(path, mode="r")
+        def _walk(grp, prefix=""):
+            for name in grp:
+                full = f"{prefix}/{name}" if prefix else name
+                item = grp[name]
+                nbs = getattr(item, "nbytes_stored", None)
+                if nbs is not None:
+                    val = nbs() if callable(nbs) else nbs
+                    key_sizes[full] = key_sizes.get(full, 0) + (val or 0)
+                elif hasattr(item, "keys"):
+                    _walk(item, full)
+        _walk(root)
+    return key_sizes
+
+
+def print_storage_breakdown(hdf5_dir, zarr_dir, num_episodes):
+    """Print per-feature storage comparison table."""
+    hdf5_keys = storage_breakdown_hdf5(hdf5_dir, num_episodes) if hdf5_dir else {}
+    zarr_keys = storage_breakdown_zarr(zarr_dir, num_episodes) if zarr_dir and os.path.isdir(zarr_dir) else {}
+    all_keys = sorted(set(list(hdf5_keys.keys()) + list(zarr_keys.keys())))
+    if not all_keys:
+        return
+
+    print(f"\n{'=' * 80}")
+    print(f"  PER-FEATURE STORAGE BREAKDOWN  (total across {num_episodes} episodes)")
+    print(f"{'=' * 80}")
+    print(f"  {'Feature':<40} {'HDF5 (MB)':>12} {'Zarr (MB)':>12} {'Ratio':>8}")
+    print(f"  {'-' * 72}")
+    for key in all_keys:
+        h = hdf5_keys.get(key, 0)
+        z = zarr_keys.get(key, 0)
+        ratio = f"{h / z:.2f}x" if z > 0 else "N/A"
+        print(f"  {key:<40} {h / 1e6:>12.2f} {z / 1e6:>12.2f} {ratio:>8}")
+    h_total = sum(hdf5_keys.values())
+    z_total = sum(zarr_keys.values())
+    print(f"  {'-' * 72}")
+    print(f"  {'TOTAL':<40} {h_total / 1e6:>12.2f} {z_total / 1e6:>12.2f} {h_total / max(z_total, 1):.2f}x")
+    print(f"{'=' * 80}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Benchmark HDF5 vs Zarr for ACT policy")
     parser.add_argument("--hdf5_dir", type=str, required=True,
@@ -926,6 +1040,9 @@ def main():
     parser.add_argument("--skip_eager", action="store_true",
                         help="Skip eager cells (saves RAM for large datasets)")
     args = parser.parse_args()
+
+    # Storage breakdown (always runs — cheap and informative)
+    print_storage_breakdown(args.hdf5_dir, args.zarr_dir, args.num_episodes)
 
     results = run_benchmarks(args)
     print_report(results)

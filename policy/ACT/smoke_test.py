@@ -24,13 +24,19 @@ import subprocess
 import numpy as np
 
 
-def generate_fake_hdf5(out_dir, num_episodes, episode_len, img_h, img_w, state_dim=14):
-    """Create fake HDF5 episodes that match the ACT schema."""
+def generate_fake_hdf5(out_dir, num_episodes, episode_len, img_h, img_w,
+                       state_dim=14, enriched=False):
+    """Create fake HDF5 episodes that match the ACT schema.
+
+    When enriched=True, also generates depth (float32 HxW) and segmentation
+    (uint8 HxWx3) arrays per camera, matching the demo_enriched.yml output.
+    """
     import h5py
     os.makedirs(out_dir, exist_ok=True)
     rng = np.random.default_rng(0)
+    cams = ["cam_high", "cam_right_wrist", "cam_left_wrist"]
     for i in range(num_episodes):
-        T = episode_len + rng.integers(-5, 5)  # variable episode length
+        T = episode_len + rng.integers(-5, 5)
         T = max(10, T)
         path = os.path.join(out_dir, f"episode_{i}.hdf5")
         with h5py.File(path, "w") as f:
@@ -38,10 +44,17 @@ def generate_fake_hdf5(out_dir, num_episodes, episode_len, img_h, img_w, state_d
             obs = f.create_group("observations")
             obs.create_dataset("qpos", data=rng.standard_normal((T, state_dim)).astype(np.float32))
             images = obs.create_group("images")
-            for cam in ["cam_high", "cam_right_wrist", "cam_left_wrist"]:
+            for cam in cams:
                 img = rng.integers(0, 255, size=(T, img_h, img_w, 3), dtype=np.uint8)
                 images.create_dataset(cam, data=img, dtype=np.uint8)
-        print(f"  wrote {path}  T={T}  img=({img_h}x{img_w})")
+            if enriched:
+                depths = obs.create_group("depths")
+                seg = obs.create_group("segmentation")
+                for cam in cams:
+                    depths.create_dataset(cam, data=rng.random((T, img_h, img_w)).astype(np.float32) * 5000)
+                    seg.create_dataset(cam, data=rng.integers(0, 255, size=(T, img_h, img_w, 3), dtype=np.uint8))
+        tag = " [enriched]" if enriched else ""
+        print(f"  wrote {path}  T={T}  img=({img_h}x{img_w}){tag}")
 
 
 def main():
@@ -57,6 +70,8 @@ def main():
     parser.add_argument("--compressor", type=str, default="dp",
                         choices=["dp", "dp-memory", "none", "lz4", "zstd"])
     parser.add_argument("--keep", action="store_true", help="Keep temp files after run")
+    parser.add_argument("--enriched", action="store_true",
+                        help="Generate enriched data (depth + segmentation) for storage comparison")
     parser.add_argument("--skip_training", action="store_true",
                         help="Skip the ACT training step (no CUDA needed)")
     args = parser.parse_args()
@@ -95,8 +110,10 @@ def main():
     print("=" * 70)
 
     # -------- Step 1: generate fake HDF5 --------
-    print(f"\n[1/3] Generating {args.num_episodes} fake HDF5 episodes in {hdf5_dir}")
-    generate_fake_hdf5(hdf5_dir, args.num_episodes, args.episode_len, args.img_h, args.img_w)
+    enr_tag = " [enriched]" if args.enriched else ""
+    print(f"\n[1/3] Generating {args.num_episodes} fake HDF5 episodes in {hdf5_dir}{enr_tag}")
+    generate_fake_hdf5(hdf5_dir, args.num_episodes, args.episode_len, args.img_h, args.img_w,
+                       enriched=args.enriched)
 
     # -------- Step 2: convert to Zarr --------
     script_dir = os.path.dirname(os.path.abspath(__file__))
